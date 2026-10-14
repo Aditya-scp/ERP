@@ -6,12 +6,12 @@
 ERP is a multi-tenant school management software-as-a-service (SaaS) platform engineered to serve thousands of independent educational institutions from a single unified codebase and database. It provides comprehensive administrative, academic, financial, communication, and learning tools across modern Web (Next.js App Router, Tailwind CSS, shadcn/ui, TanStack Table) and Mobile (Expo, Expo Router, NativeWind) environments.
 
 ### 1.2 Core Architectural Invariants (Binding)
-1. **Multi-Tenancy & Isolation**: Tenancy is strictly isolated at the database level via PostgreSQL Row Level Security (RLS). Every tenant table, including junction and child tables, contains a mandatory, non-nullable, indexed foreign key `school_id` referencing `schools(id)`.
+1. **Multi-Tenancy & Isolation**: Tenancy is strictly isolated at the database level via PostgreSQL Row Level Security (RLS). Every tenant table, including junction and child tables, contains a mandatory, non-nullable, indexed foreign key `school_id` referencing `schools(id) ON DELETE RESTRICT`.
 2. **Security Claims via JWT**: User identity, tenant scope (`school_id`), and role assignments (`role`) are derived exclusively from cryptographically signed Supabase Auth JWT custom claims emitted by database Auth Hooks. Client-provided tenant or role parameters are never trusted.
 3. **Enrollment-Centric Academic Life**: Students are physical people tracked in `students`. Academic participation is modeled via `student_enrollments`, which links a student to an `academic_session_id`, `class_id`, `section_id`, and `roll_number`. All operational, evaluative, and financial child records—including **attendance** (`student_attendances`), **exam marks** (`exam_marks`), **fee vouchers** (`fee_vouchers`), and **fee ledger entries** (`fee_ledger_entries`)—reference `enrollment_id` (foreign key to `student_enrollments(id)`). This guarantees complete historical data integrity across academic years and student promotions.
 4. **Append-Only Immutable Fee Ledger**: Financial integrity is maintained via `fee_ledger_entries`. Mutable balances on student or voucher tables are strictly prohibited. Balances are computed in real time via signed ledger aggregation. Corrections, fee cancellations, waivers, and reversals are written as new compensating entries with explicit `reverses_entry_id` references.
-5. **Session Rollover & Arrears**: When an academic session concludes, unpaid fee balances are rolled into the student's new enrollment record as a single `opening_balance` ledger entry. Prior session ledger entries remain untouched and permanently immutable.
-6. **Financial Precision**: All monetary values are represented as unsigned or signed `bigint` minor units (e.g., cents, paise, pence) paired with an ISO-4217 three-letter currency code (`currency`). Floating-point arithmetic is forbidden. Rounding follows the half-up method to 2 decimal places, applied individually to each line item before summation.
+5. **Session Rollover & Arrears**: When an academic session concludes, unpaid fee balances (or overpaid advance credits) are rolled into the student's new enrollment record as a single `opening_balance` ledger entry. Prior session ledger entries remain untouched and permanently immutable.
+6. **Financial Precision & Signed Ledger Balance**: `fee_ledger_entries.amount` is a signed `bigint` minor units: positive amounts raise what the student owes (`charge`, `fine`, `refund`), while negative amounts lower what the student owes (`payment`, `discount`, `advance_applied`). The student ledger balance is computed strictly as $\text{Balance} = \sum \text{amount}$. Floating-point arithmetic is strictly forbidden. Rounding follows the half-up method applied to the absolute value while preserving sign, computed individually per line item before summation.
 7. **Payment & External Service Adapters**: Online payment processing, SMS dispatch, WhatsApp messaging, and email delivery are decoupled behind abstract provider interfaces (`PaymentGatewayAdapter`, `SmsAdapter`, `WhatsAppAdapter`, `EmailAdapter`), allowing independent configuration per tenant.
 8. **Job Queue & Scheduling**: Asynchronous bulk operations (fee voucher generation, exam rank tabulations, mass notifications, report exports) utilize an internal `job_queue` table executed via `pg_cron` triggers and Supabase Edge Functions with row locking and exponential backoff.
 9. **Gapless Document Sequences**: Fee vouchers, payment receipts, and formal school certificates utilize dedicated sequence counter tables (`document_sequences`) with row-level locks (`SELECT ... FOR UPDATE`) to guarantee strictly monotonic, gapless numbering.
@@ -24,7 +24,7 @@ ERP is a multi-tenant school management software-as-a-service (SaaS) platform en
 ### 2.1 Role Definitions
 - **`super_admin`**: Platform owner / SaaS operator. Manages school tenants, subscription packages, module licensing, system health, and audited school impersonation sessions.
 - **`school_admin`**: Institutional leader, principal, or designated administrator. Holds full operational authority within their assigned `school_id`, configuring academic sessions, classes, fee structures, grading schemes, and staff assignments.
-- **`accountant`**: Financial operator within a school. Generates monthly fee vouchers, collects fees, issues payment receipts, manages daily expense vouchers, records bank deposits, and executes daily cash closing. Restriced from viewing academic marks or confidential student medical notes.
+- **`accountant`**: Financial operator within a school. Generates monthly fee vouchers, collects fees, issues payment receipts, manages daily expense vouchers, records bank deposits, and executes daily cash closing. Restricted from viewing academic marks or confidential student medical notes.
 - **`teacher`**: Academic instructor. Marks daily/period student attendance, enters exam and test marks, creates homework assignments, records student diary entries, and views class schedules. Scoped strictly to assigned classes and subjects.
 - **`student`**: Enrolled learner. Views personal attendance, class timetable, examination date sheets, report cards, homework tasks, fee challans/receipts, and school circulars. Scoped strictly to their own enrollment record.
 - **`parent`**: Guardian of one or more enrolled students. Accesses a unified portal with a multi-child switchboard to monitor attendance, fee dues, payment history, report cards, and communicate with teachers.
@@ -37,6 +37,9 @@ To prevent implementation ambiguity, all quantitative calculations are formalize
 
 ### 3.1 Late Fine Calculation
 Late fees are charged when a fee voucher remains unpaid after its specified `due_date`. Two calculation modes are supported: `fixed_amount` and `per_day`. Both support an optional `grace_period_days` and `max_fine_minor_units`. Compounding interest is strictly prohibited.
+
+#### Grace Period Invariant:
+The grace period provides a penalty-free window for on-time settlement. However, once the grace period is exceeded ($\text{Days Overdue} > \text{Grace Period Days}$), **all days elapsed since the original due date are charged retroactively** (i.e., $\text{Chargeable Days} = \text{Days Overdue}$, NOT $\text{Days Overdue} - \text{Grace Period Days}$). For example, if the due date is October 10 and the grace period is 5 days, paying on October 18 incurs a fine for all 8 overdue days ($8 \times \text{daily rate}$), not 3 days. (The alternative of charging only days elapsed after grace is documented in `docs/OPEN_QUESTIONS.md` for school administrative decision).
 
 #### Formulas:
 $$\text{Days Overdue} = \max(0, \text{Payment Date} - \text{Due Date})$$
@@ -54,12 +57,12 @@ $$\text{Chargeable Days} = \begin{cases} 0 & \text{if } \text{Days Overdue} \le 
   - Due Date: October 10, 2026.
   - Grace Period: 5 days (Grace cutoff = October 15, 2026 at 23:59:59 UTC).
   - Mode: `per_day`.
-  - Daily Rate: 150 cents (\$1.50/day).
-  - Max Fine Cap: 1,500 cents (\$15.00).
+  - Daily Rate: 150 cents ($1.50/day).
+  - Max Fine Cap: 1,500 cents ($15.00).
 - **Case 1 (Paid on October 14, 2026)**:
-  - Days Overdue = 4. Since $4 \le 5$, Chargeable Days = 0. Fine = **0 cents (\$0.00)**.
+  - Days Overdue = 4. Since $4 \le 5$, Chargeable Days = 0. Fine = **0 cents ($0.00)**.
 - **Case 2 (Paid on October 18, 2026)**:
-  - Days Overdue = 8. Since $8 > 5$, Chargeable Days = 8.
+  - Days Overdue = 8. Since $8 > 5$, Chargeable Days = 8 (all days since due date).
   - Raw Fine = $8 \times 150 = 1,200\text{ cents (\$12.00)}$.
   - Cap Evaluation: $\min(1200, 1500) = \mathbf{1,200\text{ cents (\$12.00)}}$.
 - **Case 3 (Paid on November 05, 2026)**:
@@ -70,10 +73,10 @@ $$\text{Chargeable Days} = \begin{cases} 0 & \text{if } \text{Days Overdue} \le 
 ---
 
 ### 3.2 Discounts & Sibling Policy
-Discounts reduce fee liabilities and can be configured as a fixed minor unit amount or a percentage. Sibling discounts are governed by parental linking via `guardian_id`.
+Discounts reduce fee liabilities and can be configured as a fixed minor unit amount or a percentage. Sibling discounts are governed by parental linking via `student_guardians`.
 
 #### Rules:
-1. Sibling discounts apply strictly to children associated with the identical `guardian_id`.
+1. Sibling discounts apply strictly to children associated with the identical `guardian_id` via `student_guardians`.
 2. Children are sorted by `date_of_birth` ascending (oldest child first).
 3. The eldest child (Child #1) pays full standard fees (0% discount).
 4. Configurable discount tiers apply to subsequent children (Child #2, Child #3, etc.).
@@ -87,11 +90,11 @@ Discounts reduce fee liabilities and can be configured as a fixed minor unit amo
   - Child 2 (Born 2016-09-15, Grade 4): Second child $\to$ Tier 2 (20% tuition discount).
   - Child 3 (Born 2019-02-01, Grade 1): Third child $\to$ Tier 3 (50% tuition discount).
 - **Fee Particulars for the Month**:
-  - Grade 6: Tuition = 12,000 cents (\$120.00), Science Lab = 1,500 cents (\$15.00).
-  - Grade 4: Tuition = 10,000 cents (\$100.00), Computer Lab = 1,000 cents (\$10.00).
-  - Grade 1: Tuition = 8,000 cents (\$80.00), Art Supplies = 800 cents (\$8.00).
+  - Grade 6: Tuition = 12,000 cents ($120.00), Science Lab = 1,500 cents ($15.00).
+  - Grade 4: Tuition = 10,000 cents ($100.00), Computer Lab = 1,000 cents ($10.00).
+  - Grade 1: Tuition = 8,000 cents ($80.00), Art Supplies = 800 cents ($8.00).
 - **Calculations**:
-  - Child 1: Tuition = 12,000 cents, Lab = 1,500 cents. Total = **13,500 cents (\$135.00)**.
+  - Child 1: Tuition = 12,000 cents, Lab = 1,500 cents. Total = **13,500 cents ($135.00)**.
   - Child 2:
     - Tuition Discount = $\text{round}(10000 \times 0.20) = 2,000\text{ cents}$.
     - Net Tuition = $10000 - 2000 = 8,000\text{ cents}$.
@@ -106,43 +109,71 @@ Discounts reduce fee liabilities and can be configured as a fixed minor unit amo
 
 ---
 
-### 3.3 Session Rollover & Arrears Carry-Forward
-Financial records maintain absolute referential integrity across academic years. When student enrollment transitions from Session $N$ to Session $N+1$, unpaid balances in Session $N$ are consolidated and rolled over.
+### 3.3 Session Rollover & Arrears / Advance Carry-Forward
+Financial records maintain absolute referential integrity across academic years. When student enrollment transitions from Session $N$ to Session $N+1$, the net ledger balance in Session $N$ is consolidated and carried forward.
 
 #### Rules:
 1. All ledger entries for Session $N$ remain tied to `enrollment_id_old`.
-2. When the school admin executes Session Close / Rollover, the system calculates the net outstanding balance for `enrollment_id_old`:
-   $$\text{Arrears Balance} = \sum (\text{Debits}) - \sum (\text{Credits})$$
-3. If $\text{Arrears Balance} > 0$, the system generates an entry in `fee_ledger_entries` tied to the new enrollment `enrollment_id_new`:
+2. When the school admin executes Session Close / Rollover, the system calculates the closing ledger balance for `enrollment_id_old`:
+   $$\text{Closing Balance} = \sum_{e \in \text{Session } N} e.\text{amount}$$
+3. **Positive Closing Balance (Student Owes Arrears)**:
+   If $\text{Closing Balance} > 0$, the system generates an entry in `fee_ledger_entries` tied to the new enrollment `enrollment_id_new`:
    - `entry_type`: `'opening_balance'`
-   - `amount`: $+\text{Arrears Balance}$
+   - `amount`: $+\text{Closing Balance}$ (positive debit)
    - `reverses_entry_id`: `NULL`
-   - `description`: `'Arrears carried forward from Academic Session 2025-2026'`
-4. The historical ledger of Session $N$ is locked from further mutations.
+   - `description`: `'Arrears carried forward from Academic Session [Previous Session]'`
+4. **Negative Closing Balance (Student Overpaid / Advance Credit)**:
+   If $\text{Closing Balance} < 0$, the system generates an entry in `fee_ledger_entries` tied to the new enrollment `enrollment_id_new`:
+   - `entry_type`: `'opening_balance'`
+   - `amount`: $\text{Closing Balance}$ (negative credit, preserving sign e.g., `-5000`)
+   - `reverses_entry_id`: `NULL`
+   - `description`: `'Advance credit carried forward from Academic Session [Previous Session]'`
+5. **Zero Balance**: If $\text{Closing Balance} = 0$, zero opening balance entries are generated.
+6. The historical ledger of Session $N$ remains permanently immutable.
 
-#### Worked Example:
+#### Worked Example 1 (Unpaid Arrears Carried Forward):
 - **Session 2025-2026 Enrollment (E-101)**:
   - May 2026 Tuition Charge: $+10,000\text{ cents}$.
   - May 2026 Late Fine Charge: $+1,000\text{ cents}$.
   - Partial Payment Received: $-6,000\text{ cents}$.
   - June 2026 Tuition Charge: $+10,000\text{ cents}$.
-  - Net Outstanding Balance at Session End = $(10000 + 1000 + 10000) - 6000 = \mathbf{15,000\text{ cents (\$150.00)}}$.
+  - Closing Balance at Session End = $10000 + 1000 - 6000 + 10000 = \mathbf{+15,000\text{ cents (\$150.00)}}$.
 - **Rollover to Session 2026-2027 Enrollment (E-202)**:
   - System inserts single row into `fee_ledger_entries`:
-    - `id`: `uuid_generate_v4()`
+    - `id`: `gen_random_uuid()`
     - `enrollment_id`: `E-202`
     - `entry_type`: `'opening_balance'`
-    - `amount`: `15000`
+    - `amount`: `+15000`
     - `currency`: `'USD'`
   - First voucher of new session displays:
     - Opening Arrears: \$150.00
     - July 2026 Tuition: \$110.00 (11,000 cents)
     - Total Due: **\$260.00 (26,000 cents)**.
 
+#### Worked Example 2 (Overpaid Advance Credit Carried Forward):
+- **Session 2025-2026 Enrollment (E-105)**:
+  - May 2026 Tuition Charge: $+10,000\text{ cents}$.
+  - June 2026 Tuition Charge: $+10,000\text{ cents}$.
+  - Advance Lump Sum Payment Received: $-25,000\text{ cents}$.
+  - Closing Balance at Session End = $10000 + 10000 - 25000 = \mathbf{-5,000\text{ cents (-\$50.00)}}$ (Overpaid credit).
+- **Rollover to Session 2026-2027 Enrollment (E-205)**:
+  - System inserts single row into `fee_ledger_entries`:
+    - `id`: `gen_random_uuid()`
+    - `enrollment_id`: `E-205`
+    - `entry_type`: `'opening_balance'`
+    - `amount`: `-5000` (signed negative integer)
+    - `currency`: `'USD'`
+    - `description`: `'Advance credit carried forward from Academic Session 2025-2026'`
+  - First voucher of new session (July 2026, Tuition = $+12,000\text{ cents}$):
+    - Opening Credit: -\$50.00 (-5,000 cents)
+    - July 2026 Tuition: +\$120.00 (+12,000 cents)
+    - Net Amount Payable: **\$70.00 (7,000 cents)**.
+    - Running Ledger Balance: $-5000 + 12000 = \mathbf{+7,000\text{ cents}}$.
+
 ---
 
 ### 3.4 Payment Allocation (Waterfall / FIFO Liquidation)
-When a student or parent makes a partial payment against a voucher or outstanding account, funds are liquidated through a deterministic FIFO (First-In, First-Out) priority waterfall.
+When a student or parent makes a partial payment against a voucher or outstanding account, funds are liquidated through a deterministic FIFO (First-In, First-Out) priority waterfall stored in `fee_payment_allocations`.
 
 #### Allocation Waterfall Priority:
 1. **Priority 1: Historical Arrears / Opening Balance** (Oldest debt cleared first).
@@ -217,84 +248,169 @@ $$\text{Cumulative GPA} = \text{round}\left(\frac{\sum (\text{Subject Grade Poin
 ---
 
 ### 3.6 Class Ranking and Tie-Breaking Logic
-School class ranking employs **Standard Competition Ranking** (`1, 2, 2, 4` - "1224" ranking) as the default institutional setting (with configurable option for Dense Ranking `1, 2, 2, 3`).
 
-#### Deterministic 5-Stage Tie-Breaker Sequence:
-When two or more students achieve identical total obtained marks in an exam term, ties are resolved sequentially:
-1. **Stage 1**: Highest Total Marks Obtained across all subjects in the exam term.
-2. **Stage 2**: Highest Total Marks in designated **Core Subjects** (configured per class, e.g., Mathematics first, then English).
-3. **Stage 3**: Highest overall attendance percentage during the academic term.
-4. **Stage 4**: Student Age ascending (older student by date of birth gets seniority rank).
-5. **Stage 5**: Admission Number ascending (lexicographical/numerical order as absolute deterministic final tie-breaker).
+#### Institutional Ranking Settings:
+Schools configure ranking behavior via two settings in `school_settings`:
+1. `rank_mode`:
+   - `'shared'` (**Default**): Students with identical total obtained marks share the exact same rank position. The ranking distribution follows `rank_sharing_format`.
+   - `'tie_break'`: Resolves identical marks sequentially using deterministic multi-stage tie-breakers to assign strictly unique positions.
+2. `rank_sharing_format` (Used when `rank_mode = 'shared'`):
+   - `'competition'` (**Default**): Standard Competition Ranking (`1, 2, 2, 4` - gap left after ties).
+   - `'dense'`: Dense Ranking (`1, 2, 2, 3` - consecutive ranks without gaps).
 
-#### Worked Example:
-Consider 5 students in Grade 10-A (Core Subject: Mathematics):
+#### Deterministic 4-Stage Tie-Breaker Sequence (Used when `rank_mode = 'tie_break'`):
+When two or more students achieve identical total obtained marks in an examination term, ties are resolved sequentially across the following stages (omitting total marks, which are already identical):
+- **Stage 1: Core Subject Performance**: Highest obtained marks in designated **Core Subjects** (configured per class, e.g., Mathematics first, followed by English).
+- **Stage 2: Academic Attendance**: Highest overall attendance percentage across the academic term.
+- **Stage 3: Age Seniority**: Student Date of Birth ascending (older student by calendar date of birth receives seniority rank).
+- **Stage 4: Admission Number**: Admission Number ascending (lexicographical/numerical order as deterministic final resolution).
+
+#### Worked Example 1 (`rank_mode = 'shared'`):
+Consider 5 students in Grade 10-A:
+- **Student A**: Total Marks = 475/500
+- **Student B**: Total Marks = 460/500
+- **Student C**: Total Marks = 460/500
+- **Student D**: Total Marks = 460/500
+- **Student E**: Total Marks = 430/500
+
+- **Under Standard Competition Ranking (`1, 2, 2, 4`)**:
+  - Student A: Rank **1**
+  - Student B: Rank **2** (Shared)
+  - Student C: Rank **2** (Shared)
+  - Student D: Rank **2** (Shared)
+  - Student E: Rank **5** (Ranks 3 and 4 skipped due to 3-way tie at Rank 2)
+
+- **Under Dense Ranking (`1, 2, 2, 3`)**:
+  - Student A: Rank **1**
+  - Student B: Rank **2** (Shared)
+  - Student C: Rank **2** (Shared)
+  - Student D: Rank **2** (Shared)
+  - Student E: Rank **3** (Next immediate rank integer assigned)
+
+#### Worked Example 2 (`rank_mode = 'tie_break'`):
+Same 5 students with tie-break metadata (Core Subject = Mathematics):
 - **Student A**: Total Marks = 475/500, Math = 98.
 - **Student B**: Total Marks = 460/500, Math = 94, Attendance = 96.5%, DOB = 2010-03-12.
 - **Student C**: Total Marks = 460/500, Math = 94, Attendance = 96.5%, DOB = 2010-07-25.
 - **Student D**: Total Marks = 460/500, Math = 90, Attendance = 98.0%, DOB = 2010-01-10.
 - **Student E**: Total Marks = 430/500.
 
-#### Resolution:
-- Student A: Rank **1** (Highest marks = 475).
-- Evaluating B, C, D (All tied at 460 total marks):
-  - Check Core Subject (Math): B has 94, C has 94, D has 90.
-  - D is eliminated from top tie and falls behind B and C.
-  - Comparing B and C: Both have Math = 94. Both have Attendance = 96.5%.
-  - Check Stage 4 (DOB): Student B (born March 12, 2010) is older than Student C (born July 25, 2010).
-  - Under Standard Competition Ranking (`1, 2, 2, 4`), if B and C were completely tied they would both share Rank 2 and the next would be Rank 4. However, the tie-breaker cleanly separates them:
+- **Resolution**:
+  - Student A: Rank **1** (Highest total marks = 475).
+  - Evaluating B, C, D (Tied at 460):
+    - Stage 1 (Math): B has 94, C has 94, D has 90. Student D drops to Rank 4.
+    - Stage 2 (Attendance): B has 96.5%, C has 96.5% (Tied).
+    - Stage 3 (DOB): Student B (born 2010-03-12) is older than Student C (born 2010-07-25).
     - Student B achieves Rank **2**.
     - Student C achieves Rank **3**.
     - Student D achieves Rank **4**.
-- Student E: Rank **5**.
+  - Student E: Rank **5**.
 
 ---
 
 ### 3.7 Student Promotion Evaluation Rules
 At the conclusion of an academic session, students are evaluated for advancement to the next grade based on institutional criteria configured in `academic_setup`.
 
-#### Standard Criteria:
-1. **Pass Condition**: Must achieve Grade D or higher ($\ge 50.00\%$) in at least 5 out of 6 subjects.
-2. **Mandatory Subjects**: Must pass Mathematics and English regardless of overall count.
-3. **Aggregate Minimum**: Cumulative percentage across all subjects must be $\ge 50.00\%$.
-4. **Attendance Threshold**: Term attendance must be $\ge 75.00\%$.
+#### Promotion Evaluation Decision Table:
+The decision engine evaluates every combination of:
+1. **Failed Subjects**: `0`, `1`, or `2 or more`.
+2. **Mandatory Subject Failed**: `No` or `Yes` (Mandatory subjects: Mathematics, English). Note: 0 failed subjects inherently requires Mandatory Failed = `No`.
+3. **Aggregate Percentage**: `< 50.00%`, `50.00% - 54.99%`, or `55.00% or more`.
+4. **Attendance Percentage**: `< 75.00%`, `75.00% - 79.99%`, or `80.00% or more`.
 
-#### Status Transitions:
-- `promoted`: Meets all criteria. Enrolled into Class $N+1$, Section assigned, status = `enrolled`.
-- `promoted_on_trial`: Failed exactly 1 non-mandatory subject, but aggregate $\ge 55.00\%$ and attendance $\ge 80.00\%$. Advanced to Class $N+1$ with probation flag.
-- `retained`: Failed 2 or more subjects OR failed a mandatory subject OR aggregate $< 50.00\%$. Retained in Class $N$ for next session.
+| Failed Subjects | Mandatory Failed? | Aggregate % Range | Attendance < 75.00% | Attendance 75.00% - 79.99% | Attendance $\ge$ 80.00% |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **0** | **No** | $< 50.00\%$ | `retained` | `retained` | `retained` |
+| **0** | **No** | $50.00\% - 54.99\%$ | `retained` | `promoted` | `promoted` |
+| **0** | **No** | $\ge 55.00\%$ | `retained` | `promoted` | `promoted` |
+| **1** | **No** | $< 50.00\%$ | `retained` | `retained` | `retained` |
+| **1** | **No** | $50.00\% - 54.99\%$ | `retained` | `retained` | `retained` |
+| **1** | **No** | $\ge 55.00\%$ | `retained` | `retained` | `promoted_on_trial` |
+| **1** | **Yes** | $< 50.00\%$ | `retained` | `retained` | `retained` |
+| **1** | **Yes** | $50.00\% - 54.99\%$ | `retained` | `retained` | `retained` |
+| **1** | **Yes** | $\ge 55.00\%$ | `retained` | `retained` | `retained` |
+| **$\ge$ 2** | **No** | $< 50.00\%$ | `retained` | `retained` | `retained` |
+| **$\ge$ 2** | **No** | $50.00\% - 54.99\%$ | `retained` | `retained` | `retained` |
+| **$\ge$ 2** | **No** | $\ge 55.00\%$ | `retained` | `retained` | `retained` |
+| **$\ge$ 2** | **Yes** | $< 50.00\%$ | `retained` | `retained` | `retained` |
+| **$\ge$ 2** | **Yes** | $50.00\% - 54.99\%$ | `retained` | `retained` | `retained` |
+| **$\ge$ 2** | **Yes** | $\ge 55.00\%$ | `retained` | `retained` | `retained` |
 
 #### Worked Examples:
-- **Student 1**: Passes 6/6 subjects. Aggregate = 68.4%. Attendance = 92%. Result: **`promoted` to Grade 8**.
-- **Student 2**: Fails History (42%), passes remaining 5 subjects (including Math & English). Aggregate = 56.2%. Attendance = 84%. Result: **`promoted_on_trial` to Grade 8**.
-- **Student 3**: Fails Mathematics (44%), passes remaining 5 subjects. Aggregate = 58.0%. Attendance = 88%. Result: **`retained` in Grade 7** (Mandatory subject failure).
-- **Student 4**: Fails Science (38%) and Art (40%). Aggregate = 48.5%. Attendance = 71%. Result: **`retained` in Grade 7**.
+- **Student 1 (Clean Promotion)**: Passes 6/6 subjects (0 failed, Mandatory = No). Aggregate = 68.4% ($\ge 55\%$). Attendance = 92% ($\ge 80\%$).
+  - Decision Table Row 3, Col 6 $\to$ Result: **`promoted` to Grade 8**.
+- **Student 2 (Promotion on Trial)**: Fails History (42%), passes remaining 5 subjects including Math & English (1 failed, Mandatory = No). Aggregate = 56.2% ($\ge 55\%$). Attendance = 84% ($\ge 80\%$).
+  - Decision Table Row 6, Col 6 $\to$ Result: **`promoted_on_trial` to Grade 8**.
+- **Student 3 (Mandatory Subject Failure)**: Fails Mathematics (44%), passes remaining 5 subjects (1 failed, Mandatory = Yes). Aggregate = 58.0%. Attendance = 88%.
+  - Decision Table Row 9, Col 6 $\to$ Result: **`retained` in Grade 7**.
+- **Student 4 (Multiple Failures)**: Fails Science (38%) and Art (40%) (2 failed, Mandatory = No). Aggregate = 48.5%. Attendance = 71%.
+  - Decision Table Row 10, Col 4 $\to$ Result: **`retained` in Grade 7**.
+- **Student 5 (Trial Disqualified by Attendance)**: Fails Geography (41%), passes 5 subjects including Math & English (1 failed, Mandatory = No). Aggregate = 56.5% ($\ge 55\%$). Attendance = 78.0% (75% - 79.99%).
+  - Decision Table Row 6, Col 5 $\to$ Result: **`retained` in Grade 7** (Fails the strict $\ge 80.00\%$ attendance threshold required for trial promotion).
+- **Student 6 (Passed All Subjects but Attendance Below Floor)**: Passes 6/6 subjects (0 failed, Mandatory = No). Aggregate = 65.0% ($\ge 55\%$). Attendance = 72.0% ($< 75\%$).
+  - Decision Table Row 3, Col 4 $\to$ Result: **`retained` in Grade 7** (Fails the mandatory institutional attendance floor of 75.00%).
 
 ---
 
 ### 3.8 Half-Up Rounding & Line-Item Minor Unit Standard
-To eliminate accumulation drift across multi-item vouchers, rounding is performed **per line item** using standard half-up rounding.
+To eliminate rounding drift across multi-item vouchers, rounding is performed **per line item** using standard half-up rounding away from zero.
 
-#### Rule:
-$$\text{Minor Units} = \text{floor}\left(\text{Calculated Float} + 0.5\right)$$
-Each line item is rounded to integer minor units prior to summation.
+#### Rounding Rule:
+Rounding applies to the **absolute value and preserves the mathematical sign (round half away from zero)**:
+$$\text{round\_half\_away\_from\_zero}(x) = \operatorname{sgn}(x) \times \lfloor |x| + 0.5 \rfloor$$
+- Positive amounts: $\text{round}(1883.25) = 1,883$; $\text{round}(249.50) = 250$.
+- Negative amounts: $\text{round}(-1883.25) = -1,883$; $\text{round}(-249.50) = -250$.
 
 #### Worked Example:
 A student invoice has three percentage-calculated fee heads:
-1. Tuition: Base = 12,555 cents (\$125.55). Discount = 15%.
+1. **Tuition**: Base = 12,555 cents ($125.55). Discount = 15%.
    - Discount Float = $12555 \times 0.15 = 1883.25\text{ cents}$.
-   - Rounded Discount = $\text{floor}(1883.25 + 0.5) = 1,883\text{ cents (\$18.83)}$.
+   - Rounded Discount = $\text{round}(1883.25) = 1,883\text{ cents (\$18.83)}$.
    - Net Tuition = $12555 - 1883 = \mathbf{10,672\text{ cents (\$106.72)}}$.
-2. Laboratory Consumables: Base = 3,333 cents (\$33.33). Subsidy = 7.5%.
+2. **Laboratory Consumables**: Base = 3,333 cents ($33.33). Subsidy = 7.5%.
    - Subsidy Float = $3333 \times 0.075 = 249.975\text{ cents}$.
-   - Rounded Subsidy = $\text{floor}(249.975 + 0.5) = 250\text{ cents (\$2.50)}$.
+   - Rounded Subsidy = $\text{round}(249.975) = 250\text{ cents (\$2.50)}$.
    - Net Lab = $3333 - 250 = \mathbf{3,083\text{ cents (\$30.83)}}$.
-3. Municipal Educational Cess: Tax = 3.5% on gross tuition (12,555 cents).
+3. **Tax on fee head** (Generic tax head, disabled by default in school settings; when enabled, configured as 3.5% on gross tuition): Base = 12,555 cents ($125.55).
    - Tax Float = $12555 \times 0.035 = 439.425\text{ cents}$.
-   - Rounded Tax = $\text{floor}(439.425 + 0.5) = \mathbf{439\text{ cents (\$4.39)}}$.
+   - Rounded Tax = $\text{round}(439.425) = \mathbf{439\text{ cents (\$4.39)}}$.
 - **Sum of Line Items**:
   $$\text{Total Invoice Payable} = 10672 + 3083 + 439 = \mathbf{14,194\text{ cents (\$141.94)}}$$
-*(Direct non-rounded sum would produce $12555 - 1883.25 + 3333 - 249.975 + 439.425 = 14194.20 \to 14194$, validating exact consistency).*
+*(Direct unrounded sum would produce $12555 - 1883.25 + 3333 - 249.975 + 439.425 = 14194.20 \to 14194$, validating exact mathematical consistency).*
+
+---
+
+### 3.9 Advance Payment & Overpayment Accounting (Ledger Rows & Running Balance)
+When a payer tenders an amount in excess of an active voucher's net payable, the overpayment is preserved as unallocated credit on the student's enrollment ledger.
+
+#### Architectural Principle on `advance_applied`:
+- In `fee_ledger_entries`, **`advance_applied` is NEVER inserted as an additional negative monetary entry**. The cash payment entry itself (`entry_type = 'payment'`) already lowered the student's signed running balance. Inserting another negative entry when the subsequent voucher is generated would double-count the credit.
+- `advance_applied` exists **strictly as an allocation record in `fee_payment_allocations`** (linking the prior excess payment to the new voucher's head charges) and as a **deduction line item on the printed voucher / UI display** to explain why the net payable is reduced.
+
+#### Step-by-Step Worked Example:
+- **Starting State**: Enrollment E-101 has an initial ledger balance of 0 cents.
+- **Month 1 (September 2026)**:
+  - Voucher V-001 generated for 10,000 cents ($100.00).
+  - Payer tenders 14,000 cents ($140.00) in cash/bank against Voucher V-001.
+- **Month 2 (October 2026)**:
+  - Voucher V-002 generated for 10,000 cents ($100.00).
+
+#### Complete Ledger Rows & Allocation Log:
+
+| Row # | Target Entity | `id` | `entry_type` | Amount (signed minor units) | Linked Voucher | Running Ledger Balance ($\sum \text{amount}$) | Accounting Event Description |
+| :---: | :--- | :--- | :--- | :---: | :--- | :---: | :--- |
+| **1** | `fee_ledger_entries` | `row-001` | `'charge'` | `+10,000` | `V-001` | `+10,000` | Month 1 Tuition Charge. Student owes 10,000 cents. |
+| **2** | `fee_ledger_entries` | `row-002` | `'payment'` | `-14,000` | `V-001` | `-4,000` | Payer tenders 14,000 cents. Running balance is now -4,000 (4,000 advance credit). |
+| *alloc* | `fee_payment_allocations` | `alloc-01` | - | `10,000` | `V-001` | - | 10,000 allocated to V-001 tuition. V-001 status $\to$ `'paid'`. |
+| *alloc* | `fee_payment_allocations` | `alloc-02` | - | `4,000` | `NULL` | - | 4,000 unallocated advance credit tracked in allocations. |
+| **3** | `fee_ledger_entries` | `row-003` | `'charge'` | `+10,000` | `V-002` | `+6,000` | Month 2 Tuition Charge. Balance: $-4,000 + 10,000 = \mathbf{+6,000}$. |
+| *alloc* | `fee_payment_allocations` | `alloc-03` | - | `4,000` | `V-002` | - | System allocates 4,000 advance credit to V-002 charges. |
+| *view* | **Voucher V-002 Display** | - | - | - | `V-002` | - | **Display / Print Line**: Billed = \$100.00, Less Advance Applied = -\$40.00, **Net Payable = \$60.00 (6,000 cents)**. |
+
+- **Final Amount Due**: The net amount due by the student across all ledgers is strictly $\sum \text{amount} = \mathbf{+6,000\text{ cents (\$60.00)}}$.
+- **Settlement of Month 2**: When the parent pays the remaining $60.00:
+  - Row 4 written to `fee_ledger_entries`: `entry_type = 'payment'`, `amount = -6,000`, `fee_voucher_id = V-002`.
+  - Final Running Balance: $+6000 + (-6000) = \mathbf{0\text{ cents}}$. Exactly zero credit is counted twice.
 
 ---
 
@@ -347,11 +463,12 @@ Manages student biographical data, admission processing, family/sibling linking,
 
 #### 2.3 Concrete Business Rules
 1. Every student is assigned an `admission_number` that is strictly unique within the `school_id`.
-2. A student cannot exist without at least one primary `guardian` (Father, Mother, or Legal Guardian) containing a valid name and mobile phone number.
+2. A student cannot exist without at least one primary `guardian` (Father, Mother, or Legal Guardian) containing a valid name and mobile phone number linked via `student_guardians`.
 3. Every student admission automatically creates a record in `student_enrollments` for the active academic session, assigning a `roll_number` that is unique per `(academic_session_id, section_id)`.
 4. Student lifecycle states are strictly controlled:
    - `enrolled`: Actively studying and billed.
    - `promoted`: Completed prior session, successfully advanced.
+   - `promoted_on_trial`: Advanced with probation flag.
    - `retained`: Repeating the academic grade.
    - `transferred`: Departed to another institution with a Transfer Certificate.
    - `withdrawn`: Formal parental withdrawal with all dues cleared.
@@ -398,39 +515,39 @@ Maintains complete employee profiles, administrative departments, job designatio
 - [ ] Digital appointment letters can be previewed and printed with school branding.
 - [ ] Staff leave dashboard displays total, used, and remaining quotas per leave category.
 - [ ] Multi-stage leave approval workflow (HOD $\to$ Principal) with status tracking (`pending`, `approved`, `rejected`).
-- [ ] Deactivating an employee immediately revokes system login access.
+- [ ] Staff directory supports search by department, designation, and employment status.
 
 ---
 
 ### Module 4: Attendance (P0 Student, P1 Rest)
 
 #### 4.1 Overview & Scope
-Comprehensive daily and period-level attendance tracking for students and staff. Supports web manual entry, mobile fast-marking, biometric device integration, CSV punch uploads, automated absent SMS/WhatsApp notifications, and monthly tabulation sheets.
+Comprehensive daily class attendance, period-by-period subject attendance, staff attendance with biometric machine integration, automated parental absence SMS alerts, and monthly attendance broadsheets.
 
 #### 4.2 User Stories
-- **As a `teacher`**, I want to mark daily class attendance on my mobile device with one-tap defaults, so that marking 40 students takes under 30 seconds.
-- **As a `school_admin`**, I want parents of absent students to receive an automated SMS/WhatsApp alert within 30 minutes of school start, so that student safety is enforced.
-- **As an `accountant`**, I want staff attendance records synchronized with payroll, so that unpaid leaves automatically calculate salary deductions.
-- **As a `parent`**, I want to view my child's real-time attendance history and monthly attendance percentage, so that I can ensure their regular presence.
+- **As a `teacher`**, I want to mark student attendance on web or mobile in under 60 seconds, so that classroom time is maximized.
+- **As a `parent`**, I want to receive an immediate SMS/push alert if my child is marked absent, so that their safety is ensured.
+- **As a `school_admin`**, I want to import biometric attendance logs for employees, so that staff punctuality is tracked objectively.
+- **As a `school_admin`**, I want to generate monthly student attendance percentage reports, so that exam eligibility can be verified.
 
 #### 4.3 Concrete Business Rules
-1. Student attendance is recorded against `enrollment_id`, ensuring historical integrity.
-2. Attendance statuses: `present`, `absent`, `late`, `half_day`, `leave`.
-3. Database constraint enforces strict uniqueness: exactly one attendance row per `(enrollment_id, attendance_date, period_id)`. (For daily attendance, `period_id` is `NULL`).
-4. Automated absent alert job triggers at a configurable cutoff time (e.g., 09:00 AM) and enqueues notification tasks in `job_queue`.
-5. Attendance percentage is computed as:
-   $$\text{Attendance } \% = \text{round}\left(\frac{\text{Present Days} + (0.5 \times \text{Half Days}) + \text{Approved Leaves}}{\text{Total Working Days}} \times 100, 2\right)$$
+1. Attendance status values: `present`, `absent`, `late`, `half_day`, `leave`.
+2. Student daily attendance is unique per `(school_id, enrollment_id, attendance_date)`.
+3. Attendance percentage formula:
+   $$\text{Attendance } \% = \text{round}\left(\frac{\text{Present Days} + (0.5 \times \text{Half Days})}{\text{Total School Working Days}} \times 100, 2\right)$$
+4. Marking a student absent automatically queues an SMS dispatch job in `job_queue` (if school alert setting is enabled).
+5. Biometric integration maps external device user IDs to `employees.biometric_id` via a background synchronization Edge Function.
 
 #### 4.4 Edge Cases & Failure Modes
-- Teacher attempts to mark attendance for a declared school holiday: System blocks entry with error message: "Cannot mark attendance on a gazetted holiday."
-- Attendance edited after parent alert already dispatched: Audit log records the modification (`marked_by`, previous status, new status, timestamp); follow-up correction notification is optional.
+- Attendance submitted twice for the same section and date: Subsequent submissions execute an `UPDATE` on existing attendance records rather than throwing duplicate key errors.
+- Biometric machine clock drift: Synchronization adapter validates timestamps against school timezone and flags logs with extreme time discrepancies.
 
 #### 4.5 Acceptance Criteria Checklist
-- [ ] Fast attendance grid allows "Mark All Present" with single-click toggle to Absent/Late.
-- [ ] Biometric CSV upload parses device punch logs and reconciles with shift start/end times.
-- [ ] Automated background job dispatches absent SMS/WhatsApp alerts via configured provider adapter.
-- [ ] Monthly class attendance matrix exports to Excel and PDF with summary columns.
-- [ ] Student dashboard displays circular progress ring showing current month attendance percentage.
+- [ ] Quick attendance grid displays all students in a section with default "All Present" toggle.
+- [ ] Automated SMS alert dispatches within 5 minutes of attendance finalization.
+- [ ] Period-wise attendance grid tracks attendance per timetable period.
+- [ ] Monthly class attendance register generates printable PDF matrix with daily codes (P, A, L).
+- [ ] Biometric CSV upload maps punches to check-in/check-out and flags late arrivals.
 
 ---
 
@@ -480,13 +597,29 @@ Comprehensive evaluation framework managing examination terms, date sheets, roll
 #### 6.3 Concrete Business Rules
 1. Marks records reference `enrollment_id` and `exam_subject_id`.
 2. Exactly one mark entry per `(exam_subject_id, enrollment_id)`.
-3. Marks are stored as `numeric(6,2)`. Cannot exceed `max_marks` defined in the date sheet.
-4. If status is `absent`, `marks_obtained` is recorded as 0.00 and excluded from average marks computation if configured as `exempt`.
-5. Class ranking uses **Standard Competition Ranking** (`1, 2, 2, 4`) as default, executing the 5-stage tie-breaker defined in Section 3.6.
+3. Marks are stored as `numeric(6,2)` and can be `NULL`.
+4. **Evaluation Status & Scoring Rules**:
+   - **`absent`**: `marks_obtained` is stored as `NULL` in the database. In total calculations, broadsheets, and GPA computations, an absent subject is counted as 0 obtained marks while full maximum marks are retained in the denominator. The report card explicitly displays the status flag `'ABSENT'` (`'AB'`).
+   - **`exempt`**: `marks_obtained` is stored as `NULL` in the database. In student total calculations, percentages, and GPAs, an exempt subject is completely **excluded from both obtained marks and maximum marks totals** (i.e., both numerator and denominator are reduced by that subject's maximum marks). The report card displays `'EXEMPT'` (`'EX'`).
+   - **`unfair_means`**: `marks_obtained` is stored as 0.00, maximum marks included in denominator, flagged on DMC as `'UFM'`.
+5. Class ranking uses the school's configured `rank_mode` (`shared` by default or `tie_break`) formulated in Section 3.6.
 6. Composite Term Weightages: Final DMC aggregates multiple terms according to configured percentages (e.g., Term 1: 30%, Term 2: 30%, Final: 40%).
 
+#### Worked Example (Exempt vs Absent Scoring):
+- Student takes 5 enrolled subjects, each with Maximum Marks = 100.00:
+  - Mathematics: Status = `present`, Marks = 85.00 / 100.00
+  - English: Status = `present`, Marks = 75.00 / 100.00
+  - Science: Status = `present`, Marks = 90.00 / 100.00
+  - Social Studies: Status = `absent`, Marks = `NULL` / 100.00 (Treated as 0.00 obtained in totals; denominator = 100.00)
+  - Physical Education: Status = `exempt` (Medical waiver), Marks = `NULL` / 100.00 (Completely excluded from numerator and denominator)
+- **Aggregation**:
+  - Maximum Marks Total = $100 + 100 + 100 + 100 = 400.00$ (PE's 100 max marks excluded).
+  - Obtained Marks Total = $85.00 + 75.00 + 90.00 + 0.00 = 250.00$.
+  - Term Percentage = $\text{round}\left(\frac{250.00}{400.00} \times 100, 2\right) = \mathbf{62.50\%}$.
+  *(Exemption ensures the medical waiver does not penalize the student's percentage).*
+
 #### 6.4 Edge Cases & Failure Modes
-- Teacher attempts to submit marks above maximum marks: Input field enforces client validation and database `CHECK (marks_obtained <= max_marks)`.
+- Teacher attempts to submit marks above maximum marks: Client form validation and database trigger `trg_validate_exam_marks_ceiling` reject entry with error: `"marks_obtained exceeds exam schedule maximum marks."`
 - Re-evaluating marks after report cards are printed: Audit log captures modification (`updated_by`, old marks, new marks, justification); updated DMC marks report card version counter (`v2`).
 
 #### 6.5 Acceptance Criteria Checklist
@@ -511,30 +644,31 @@ Enterprise school billing engine. Features fee heads, class fee structures, bulk
 - **As a `parent`**, I want to pay my children's combined school fees online via credit card or digital wallet.
 
 #### 7.3 Concrete Business Rules
-1. **Append-Only Ledger**: Fee transactions are strictly append-only via `fee_ledger_entries`. Mutable balance fields on student or voucher tables are strictly prohibited. Balances are computed in real time via signed ledger aggregation:
-   $$\text{Current Balance} = \sum (\text{Charges, Late Fines, Opening Balances, Refunds}) - \sum (\text{Payments, Waivers, Discounts, Advance Applied})$$
-2. **Precision and Currency**: Monetary values are `bigint` minor units (e.g., cents, paise) paired with an ISO-4217 three-letter currency code. Floating-point arithmetic is forbidden.
+1. **Append-Only Signed Ledger**: Fee transactions are strictly append-only via `fee_ledger_entries`. Mutable balance fields on student or voucher tables are strictly prohibited. `fee_ledger_entries.amount` is a signed `bigint` (positive raises what student owes; negative lowers it). Balances are computed in real time via signed aggregation:
+   $$\text{Current Balance} = \sum \text{amount}$$
+   (Positive balance indicates debt owed by student; negative balance indicates advance overpayment credit).
+2. **Precision and Currency**: Monetary values are `bigint` minor units (e.g., cents, paise) paired with an ISO-4217 three-letter currency code populated from `schools.default_currency`. Floating-point arithmetic is forbidden.
 3. **Enrollment-Centric**: `fee_ledger_entries` references `enrollment_id`.
 4. **Gapless Document Sequences**: Voucher and receipt numbers are generated sequentially from `document_sequences` with row locking (`SELECT FOR UPDATE`), guaranteeing zero gaps in accounting sequences.
-5. **Sibling Discounts**: Sibling discounts apply to younger siblings linked via `guardian_id` on tuition heads as formulated in Section 3.2.
-6. **Late Fines**: Late fines follow Section 3.1 (`fixed_amount` or `per_day` with cap and grace period; strictly zero compounding).
-7. **Payment Allocation**: Partial payments are allocated via the FIFO waterfall priority in Section 3.4.
-8. **Session Rollover**: When an academic session closes, unpaid arrears are carried into the student's new enrollment record as a single `opening_balance` ledger entry, leaving prior session ledger entries completely untouched.
+5. **Sibling Discounts**: Sibling discounts apply to younger siblings linked via `student_guardians` on tuition heads as formulated in Section 3.2.
+6. **Late Fines**: Late fines follow Section 3.1 (`fixed_amount` or `per_day` with cap and grace period; strictly zero compounding). Once the grace period is exceeded, all days since the due date are charged.
+7. **Payment Allocation**: Partial payments are allocated via the FIFO waterfall priority in Section 3.4 and tracked in `fee_payment_allocations`.
+8. **Session Rollover**: When an academic session closes, net closing balances (arrears or advance credits) are carried into the student's new enrollment record as a single `opening_balance` ledger entry per Section 3.3, leaving prior session ledger entries completely untouched.
 9. **Payment Gateway Adapter**: Online payments verify webhook signatures via `PaymentGatewayAdapter` with mandatory idempotency keys.
 10. **Voucher Cancellation**: Generated vouchers cannot be directly updated or modified in-place. If an uncollected voucher contains errors, it must be cancelled with a mandatory audit reason. Cancellation appends compensating entries (`entry_type = 'reversal'`) for all charges associated with the voucher, marking the voucher status as `'cancelled'`. If a voucher already has recorded payments, cancellation is strictly blocked until those payments are reversed or refunded.
-11. **Refunds**: A refund is an outgoing transaction recorded as a distinct ledger entry (`entry_type = 'refund'`), specifying the refunded minor units, linked `reverses_entry_id` referencing the original payment entry, and a mandatory textual reason. Processing a refund requires the explicit `fees:refund` permission.
-12. **Advance Payments**: Any payment amount received in excess of the outstanding balance on a voucher or enrollment is recorded as an advance credit on the student's enrollment ledger. When the next monthly voucher is generated, any existing advance credit is automatically deducted as an opening credit line item (`entry_type = 'advance_applied'`), reducing the net payable on the new voucher.
+11. **Refunds**: A refund is an outgoing transaction recorded as a distinct ledger entry (`entry_type = 'refund'`), specifying positive minor units, linked `reverses_entry_id` referencing the original payment entry, and a mandatory textual reason. Processing a refund requires the explicit `fees:refund` permission. Reversing a refund (`entry_type = 'reversal'` pointing to a refund entry) adds the refunded amount back to `total_paid_minor_units` (e.g., on a 5,500 voucher with a 3,000 payment and 1,000 refund giving paid 2,000 and outstanding 3,500, reversing that 1,000 refund restores paid to 3,000 and reduces outstanding to 2,500).
+12. **Advance Payments**: Any payment received in excess of the outstanding balance on a voucher or enrollment leaves a negative running ledger balance. When the subsequent month's voucher is generated, the credit is allocated via `fee_payment_allocations` and displayed as an advance credit deduction on the voucher slip per Section 3.9, without inserting duplicate negative ledger rows.
 13. **Immutability & No Editing of Generated Vouchers**: Once a fee voucher is generated and assigned a sequence number, its head items and billed amounts are immutable. Editing an existing voucher in-place is strictly prohibited. To correct a mistake, the user must either (a) cancel the entire voucher (provided zero payments exist) and regenerate a new voucher with a new sequence number, or (b) post an explicit financial adjustment entry (`entry_type = 'adjustment'`) to the fee ledger with mandatory reason and authorization.
-14. **Defaulter Definition**: A student/enrollment is classified as a fee defaulter if they have any active fee voucher whose `due_date` has passed and whose outstanding balance ($\sum \text{Charges} - \sum \text{Credits}$) is strictly greater than zero minor units.
+14. **Defaulter Definition**: A student/enrollment is classified as a fee defaulter if they have any active fee voucher whose `due_date` has passed and whose dynamically derived outstanding balance ($\sum \text{amount}$) is strictly greater than zero minor units.
 
 #### 7.4 Edge Cases & Failure Modes
 1. **Vouchers generated twice for the same class and month**: The bulk generation stored procedure checks for existing active vouchers matching `(school_id, enrollment_id, billing_month, billing_year)`. If the job is re-run for the same class cohort, the database rejects duplicate generation; exactly 0 new vouchers and 0 new ledger charges are inserted. The response reports: "0 vouchers generated; all students already have vouchers for this billing period."
-2. **Overpayment (extra becomes advance credit applied to the next voucher)**: When a payment exceeds the voucher's total outstanding balance (e.g., student owes $100.00 / 10,000 cents, payer tenders $140.00 / 14,000 cents), the voucher is marked `'paid'`, and the excess $40.00 (4,000 cents) is recorded as unallocated credit on the student's enrollment ledger. When the subsequent month's voucher is generated (e.g., $100.00), the system automatically creates an `advance_applied` ledger entry for 4,000 cents, reducing the net payable on the new voucher to $60.00 (6,000 cents).
+2. **Overpayment (extra becomes advance credit applied to the next voucher)**: When a payment exceeds the voucher's total outstanding balance (e.g., student owes $100.00 / 10,000 cents, payer tenders $140.00 / 14,000 cents), the voucher is marked `'paid'`, and the excess $40.00 (4,000 cents) is recorded as unallocated credit on the student's enrollment ledger (running balance = -4,000). When the subsequent month's voucher is generated (e.g., $100.00), the system automatically allocates the credit in `fee_payment_allocations`, reducing the net payable on the new voucher display to $60.00 (6,000 cents) without writing duplicate negative ledger rows.
 3. **Cancelling a voucher that already has a payment**: The cancellation procedure checks if any payment entries (`entry_type = 'payment'`) reference the `voucher_id`. If active payments exist, the cancellation request is strictly aborted with an exception: `"Cannot cancel voucher with recorded payments. Reverse or refund payments first."` Only after all payments on the voucher are reversed (`entry_type = 'reversal'`) or refunded (`entry_type = 'refund'`) can the voucher charges be cancelled.
 4. **Fee structure changed after vouchers already exist**: Class fee structures operate on an effective date and versioning model. Modifying a fee structure (e.g., increasing tuition from $100.00 to $120.00) leaves all existing generated vouchers and ledger charges completely unchanged at their snapshot values. Only vouchers generated after the fee structure modification use the updated rates.
 5. **Student joins mid-month**: When a student is admitted mid-month, the school's configured mid-month billing rule is evaluated: if admitted on or before the 15th calendar day of the month, 100% of the monthly tuition fee is billed; if admitted on or after the 16th calendar day, a 50% prorated tuition fee (rounded half-up to minor units) is billed, alongside full one-time admission and registration charges.
 6. **Student struck off with unpaid fees**: When an enrollment status transitions to `'struck_off'` (or `'withdrawn'`), all existing unpaid ledger balances remain active and collectible as institutional debt. The bulk monthly voucher generator skips struck-off students, generating zero future charges. If the student subsequently requests academic clearance, transfer certificates, or re-admission, the accumulated debt must be settled in full.
-7. **Two cashiers collecting the same voucher at the same moment**: Collection transactions execute an explicit row-level lock on the voucher (`SELECT * FROM fee_vouchers WHERE id = $1 FOR UPDATE`). The first cashier's transaction locks the row, validates the outstanding balance, appends ledger entries, and updates the voucher balance. The second cashier's concurrent transaction is forced to wait on the lock; once released, it reads the updated remaining balance. If the first payment fully settled the voucher, the second transaction is rejected with `"Voucher has already been paid"`, preventing concurrent double-collection or over-allocation.
+7. **Two cashiers collecting the same voucher at the same moment**: Collection transactions execute an explicit row-level lock on the voucher (`SELECT * FROM fee_vouchers WHERE id = $1 FOR UPDATE`). The first cashier's transaction locks the row, validates the outstanding balance, appends ledger entries, and updates the derived status only. The second cashier's concurrent transaction is forced to wait on the lock; once released, it reads the updated remaining balance. If the first payment fully settled the voucher, the second transaction is rejected with `"Voucher has already been paid"`, preventing concurrent double-collection or over-allocation.
 8. **Gateway webhook arrives twice**: The webhook handler queries the unique `idempotency_key` (payment gateway transaction ID) against `payment_webhook_events`. A repeated webhook with the same idempotency key is acknowledged with HTTP 200 OK and ignored without re-processing. If a genuinely distinct second payment arrives for an already settled voucher (e.g., parent initiated two separate bank transfers with different gateway transaction IDs), the second payment is recorded as an advance credit on the student's enrollment and an alert is flagged in the accountant dashboard for refund review.
 9. **Payment recorded against the wrong student**: Direct modification of payment records is forbidden. The accountant must execute a payment reversal specifying the incorrect entry ID and a mandatory reason (`"Payment posted to incorrect student enrollment"`). This writes an `entry_type = 'reversal'` entry referencing `reverses_entry_id`, restoring the original student's debit balance. The accountant then records a new payment against the correct student enrollment referencing the original receipt.
 10. **Refund**: Disbursing a refund writes an entry to `fee_ledger_entries` with `entry_type = 'refund'`, linked `reverses_entry_id` referencing the original payment entry, signed minor unit amount reducing net cash/bank balances, and a mandatory textual justification. The action is guarded by RLS and requires the user to possess the `fees:refund` permission.
@@ -543,15 +677,17 @@ Enterprise school billing engine. Features fee heads, class fee structures, bulk
 
 #### 7.5 Acceptance Criteria Checklist
 - [ ] A 500-student monthly voucher generation batch run finishes in under 60 seconds via `job_queue`.
-- [ ] An independent SQL sum across all generated voucher line items for a month matches the total debits appended to `fee_ledger_entries` with exactly 0 minor units difference (`SELECT SUM(amount) FROM fee_voucher_items = SELECT SUM(amount) FROM fee_ledger_entries WHERE entry_type = 'charge'`).
+- [ ] An independent SQL sum across all generated voucher line items for a month matches the total charges appended to `fee_ledger_entries` with exactly 0 minor units difference (`SELECT SUM(amount) FROM fee_voucher_items = SELECT SUM(amount) FROM fee_ledger_entries WHERE entry_type = 'charge'`).
 - [ ] Running the bulk voucher generation job twice for the same academic session, class, and billing month creates exactly 0 duplicate vouchers and 0 duplicate ledger charges.
-- [ ] For every student enrollment in the database, the dynamically computed ledger balance (`SUM(CASE WHEN entry_type IN ('charge', 'fine', 'opening_balance', 'refund') THEN amount ELSE -amount END)`) equals the outstanding balance displayed on the student's fee card.
+- [ ] For every student enrollment in the database, the dynamically computed signed ledger balance (`SELECT SUM(amount) FROM fee_ledger_entries WHERE enrollment_id = $1`) equals the outstanding balance displayed on the student's fee card.
 - [ ] A payment reversal restores the exact prior debit balance to the minor unit with zero arithmetic drift.
 - [ ] Two simultaneous collection requests executed concurrently against the same voucher never collect an amount exceeding the outstanding balance.
 - [ ] Sequential gapless numbering verification: A SQL query `SELECT voucher_number FROM fee_vouchers ORDER BY voucher_number` across 1,000 consecutively generated vouchers reveals zero missing integer sequence values.
-- [ ] Late fine calculation verified by automated unit tests: Late fine accrued equals $\min(\text{chargeable days} \times \text{per\_day amount}, \text{max\_cap})$ with zero compounding.
+- [ ] Late fine calculation verified by automated unit tests: Late fine accrued equals $\min(\text{chargeable days} \times \text{per\_day amount}, \text{max\_cap})$ with zero compounding, charging all days since due date once grace is exceeded.
 - [ ] Payment allocation follows Section 3.4 FIFO waterfall priority exactly: arrears cleared first, late fine second, tuition third, auxiliary fourth, optional fifth.
 - [ ] Row Level Security test: In multi-tenant testing, a parent querying the vouchers API endpoint receives only vouchers associated with their linked children's `enrollment_id`s, returning 0 rows for other children in the same school.
+- [ ] Advance payment verification: When an overpayment of 14,000 cents is received against a 10,000 cents voucher, the ledger balance becomes -4,000 cents; generating next month's 10,000 cents voucher writes exactly one +10,000 charge entry, yielding a net ledger balance of +6,000 cents without double-counting advance credit (advance applied is recorded in payment allocations and displayed on the voucher without appending duplicate negative ledger amounts).
+- [ ] Voucher dynamic balance reversal verification: In v_fee_voucher_balances, a payment of 3,000 minor units on a 5,500 voucher gives paid 3,000 and outstanding 2,500; after reversing that payment, paid is 0 and outstanding is 5,500.
 
 ---
 
@@ -651,352 +787,361 @@ Omnichannel school communication platform. Manages circulars and notices, school
 
 ---
 
-### Module 11: Learning (P1, Quizzes P2)
+### Module 11: Learning / LMS (P1 Core, P2 Advanced)
 
 #### 11.1 Overview & Scope
-Academic delivery and learning management. Enables homework assignment creation, student digital file submissions, teacher grading with rubric feedback, syllabus breakdown, lesson plan tracking, downloadable study material repositories, online class video links, and interactive quizzes (P2).
+Digital classroom management encompassing daily homework assignments, digital student submissions, teacher grading with audio/text feedback, syllabus tracking, digital study materials (PDF/Video), and question paper generation.
 
 #### 11.2 User Stories
-- **As a `teacher`**, I want to post homework tasks with attached PDF worksheets and due dates, so that students know their assignments.
-- **As a `student`**, I want to upload photos of my completed homework from my phone, so that my teacher can review and grade it.
-- **As a `teacher`**, I want to log syllabus completion against lesson plan milestones, so that academic coverage is monitored.
-- **As a `teacher`**, I want to attach Google Meet or Zoom links to classes, so that remote lectures are easily accessible.
+- **As a `teacher`**, I want to publish homework assignments with attached PDF worksheets, so that students can complete them at home.
+- **As a `student`**, I want to submit photo attachments of my completed homework from the mobile app, so that my teacher can review it.
+- **As a `teacher`**, I want to track chapter-wise syllabus completion percentages, so that the academic calendar remains on schedule.
+- **As a `parent`**, I want to see which homework assignments are pending or overdue for my child.
 
 #### 11.3 Concrete Business Rules
-1. Homework records are scoped to `(academic_session_id, section_id, subject_id)` with a strict `submission_deadline`.
-2. Student submissions store uploaded file paths in private Supabase Storage buckets, prefixed by `school_id`.
-3. Submissions made after `submission_deadline` are automatically flagged with `status = 'late_submission'`.
-4. Teachers can grade submissions with marks, status (`accepted`, `rejected`, `resubmit_required`), and written feedback.
+1. Homework records are scoped to `(academic_session_id, section_id, subject_id)` with a mandatory `due_date`.
+2. Student submissions are linked to `enrollment_id`. Multiple attachments are stored in Supabase private storage (`homework/[school_id]/...`).
+3. Grading status: `pending`, `submitted`, `evaluated`, `late`.
+4. Teachers can return graded submissions with numeric marks or qualitative letter grades.
+5. Syllabus tracking tracks chapters/topics per subject with status `not_started`, `in_progress`, `completed`.
 
 #### 11.4 Edge Cases & Failure Modes
-- Student attempts to upload submission after teacher has closed grading: System blocks upload displaying "Submissions are closed for this assignment."
-- Storage file upload exceeding size quota (e.g., > 10MB): Client and server reject upload with informative error.
+- Student attempts to submit homework after due date: Submission is accepted but permanently flagged with status `'late'`.
+- Uploading non-permitted file extensions (e.g., .exe, .sh): Cloud storage upload hook rejects file; client limits uploads to PDF, JPG, PNG.
 
 #### 11.5 Acceptance Criteria Checklist
-- [ ] Teacher homework interface supports rich instructions, multiple document attachments, and due dates.
-- [ ] Student portal displays active assignments, countdown timer to deadline, and upload modal.
-- [ ] Teacher grading screen presents split view (student submission preview on left, grading form on right).
-- [ ] Syllabus progress tracker visualizes percentage completion per subject and term.
-- [ ] Study material repository categorizes files by subject, chapter, and file type.
+- [ ] Homework creation form supports rich text instructions, due date/time, and multiple file attachments.
+- [ ] Mobile app submission interface allows camera photo capture and PDF document upload.
+- [ ] Teacher grading screen provides side-by-side view of student work and grading rubrics.
+- [ ] Syllabus progress tracker shows overall percentage and chapter completion dates per subject.
+- [ ] Study material repository categorizes files by subject, class, and downloadable offline state.
 
 ---
 
 ### Module 12: Library (P2)
 
 #### 12.1 Overview & Scope
-Institutional library circulation and cataloging. Manages book master catalog (ISBN, author, publisher, rack location, barcode/RFID), student and staff library memberships, circulation (book issue, return, renewal), and automated overdue fine calculations.
+Institutional book and media asset cataloging. Features ISBN cataloging, barcode generation, book checkout/issue, return processing, damaged/lost book tracking, and overdue fine calculation.
 
 #### 12.2 User Stories
-- **As a `librarian`**, I want to catalog books with barcode IDs and rack locations, so that books are easily locatable.
-- **As a `librarian`**, I want to issue books to students by scanning member and book barcodes, so that checkouts take seconds.
-- **As a `librarian`**, I want overdue books to calculate late fines automatically upon return, so that library policies are maintained.
-- **As a `student`**, I want to search the library catalog and view my borrowed books and due dates.
+- **As a `librarian`**, I want to catalog books by ISBN, title, author, and rack location, so that library assets are organized.
+- **As a `librarian`**, I want to issue books by scanning the book barcode and the student's ID card barcode, so that circulation is fast.
+- **As a `student`**, I want to search the library catalog on mobile, so that I can see if a book is currently available.
+- **As a `librarian`**, I want to charge overdue fines for books returned past the due date.
 
 #### 12.3 Concrete Business Rules
-1. Every book physical copy possesses a unique `barcode` / `accession_number` within the school.
-2. Max books allowed concurrently: Students = 2 books, Staff = 5 books (configurable).
-3. Standard loan period: 14 calendar days.
-4. Overdue fine: Fixed daily rate (e.g., 50 cents/day) starting on day 15 until return date. Fine is appended to student's fee ledger or collected as cash.
+1. Each physical copy of a book has a unique `accession_number` and barcode.
+2. Max books issued simultaneously is governed by role policy (e.g., Student = 2 books, Teacher = 5 books).
+3. Loan duration is configurable (default: 14 calendar days).
+4. Overdue Fine Calculation:
+   $$\text{Days Overdue} = \max(0, \text{Return Date} - \text{Due Date})$$
+   $$\text{Overdue Fine} = \text{Days Overdue} \times \text{Daily Library Fine Rate}$$
+5. Lost books trigger a replacement charge equal to book purchase price plus an administrative fee.
 
 #### 12.4 Edge Cases & Failure Modes
-- Attempting to issue a book that is already checked out: System blocks transaction with message: "Book copy is currently issued to Member #X."
-- Student attempts to check out a book while carrying overdue books: Checkout blocked until overdue items are returned or fines cleared.
+- Student with overdue book attempts to withdraw or graduate: Module 16 (Certificates) blocks issuance of Clearance / Transfer Certificate until library returns are completed.
+- Returning a damaged book: Librarian flags status as `damaged`, recording penalty charge in Module 7 (Fees).
 
 #### 12.5 Acceptance Criteria Checklist
-- [ ] Catalog search filters by title, author, category, ISBN, and rack location.
-- [ ] Rapid barcode issue/return interface with audio confirmation beeps.
-- [ ] Automated overdue fine calculator applies daily penalty upon return.
-- [ ] Lost book workflow assesses replacement book fee charge to student fee ledger.
-- [ ] Library circulation reports identify most borrowed books, active loans, and overdue members.
+- [ ] Book cataloging supports ISBN lookup, rack/shelf tagging, and multiple physical copies.
+- [ ] Barcode-based circulation workflow for single-click book issue and return.
+- [ ] Overdue book tracker lists unreturned items and computes fines per day.
+- [ ] Student library history view displays borrowed titles, return dates, and fine receipts.
+- [ ] Stock verification tool audits scanned barcodes against physical shelf inventory.
 
 ---
 
 ### Module 13: Inventory (P2)
 
 #### 13.1 Overview & Scope
-Institutional asset and stock management. Tracks item master catalog (stationery, textbooks, uniforms, sports equipment, lab consumables), suppliers, purchase orders, stock-in/stock-out transactions, departmental issue logs, and low-stock alerts.
+School asset and consumable inventory control. Tracks item categories, vendor suppliers, purchase orders, goods receipt notes (GRN), departmental stock issuance, low-stock threshold alerts, and annual asset depreciation.
 
 #### 13.2 User Stories
-- **As a `school_admin`**, I want to track warehouse stock levels, so that the school never runs out of essential supplies.
-- **As an `inventory_manager`**, I want to record supplier purchases with invoice numbers and unit costs, so that inventory expenses are accounted for.
-- **As an `inventory_manager`**, I want to issue items to staff members or departments, so that asset consumption is tracked.
+- **As a `school_admin`**, I want to catalog school assets (desks, lab equipment, computers) with serial numbers and warranty dates.
+- **As a `clerk`**, I want to record stationery purchases and track remaining consumable stock (notebooks, printer paper, chalk).
+- **As a `teacher`**, I want to request classroom supplies digitally, so that stationery issuance is approved and tracked.
+- **As an `accountant`**, I want inventory purchases automatically linked to expense accounts in Module 8.
 
 #### 13.3 Concrete Business Rules
-1. Inventory items are categorized: `consumable` (stationery, lab chemicals) or `fixed_asset` (furniture, computers).
-2. Stock adjustments are recorded in an append-only `inventory_transactions` ledger (`stock_in`, `stock_out`, `transfer`, `adjustment`, `loss`). Current stock is computed:
-   $$\text{Available Stock} = \sum (\text{Stock In}) - \sum (\text{Stock Out})$$
-3. When available stock drops below `reorder_level`, an automated alert badge is displayed on the dashboard.
+1. Inventory items are categorized as `fixed_asset` or `consumable`.
+2. Stock movement ledger (`inventory_transactions`) is append-only:
+   $$\text{Current Stock} = \sum (\text{Purchases, Returns}) - \sum (\text{Issues, Disposals, Write-Offs})$$
+3. Item issuance requires an approved digital requisition voucher.
+4. Stock quantities cannot fall below zero; transactions that would cause negative stock are rejected.
+5. Items below `reorder_level` appear on the automated Low Stock Alert dashboard.
 
 #### 13.4 Edge Cases & Failure Modes
-- Attempting to issue stock exceeding available warehouse balance: System blocks transaction with error: "Insufficient stock available."
-- Returning defective stock to supplier: Generates `stock_out` transaction of type `vendor_return` and records credit memo.
+- Disposing of a fixed asset with remaining book value: System requires `school_admin` approval and records write-off loss in Accounts.
+- Supplier invoice amount differs from Purchase Order: GRN workflow records invoice discrepancy and routes to accountant for reconciliation.
 
 #### 13.5 Acceptance Criteria Checklist
-- [ ] Item catalog tracks SKU, item name, unit of measure (pieces, boxes, kg), and reorder threshold.
-- [ ] Purchase entry records vendor, invoice date, quantity, unit price, and target warehouse.
-- [ ] Staff issue modal records issuing date, department, recipient signature/acknowledgment.
-- [ ] Stock balance report displays current stock value, total received, and total issued.
-- [ ] Low-stock notification triggers when inventory falls below minimum threshold.
+- [ ] Item master catalog captures item code, category, unit of measure, reorder level, and unit cost.
+- [ ] Vendor supplier directory tracks contact details, tax numbers, and purchase order history.
+- [ ] Requisition and issuance workflow tracks departmental stock transfers.
+- [ ] Low-stock dashboard flags items requiring replenishment with exportable purchase requisition.
+- [ ] Asset audit report lists room locations, serial numbers, and condition ratings (Good, Damaged, Obsolete).
 
 ---
 
 ### Module 14: Transport (P2)
 
 #### 14.1 Overview & Scope
-Student transportation operations. Manages bus routes, vehicle fleets, maintenance logs, drivers and attendants, pickup/drop stops, student stop assignments, and automated monthly transport fee integration with Module 7 (Fees).
+Fleet and route logistics management. Covers bus vehicle profiles, route definitions with designated stops and pickup times, driver/conductor licensing, student transport subscriptions, and recurring monthly transport fee billing.
 
 #### 14.2 User Stories
-- **As a `transport_manager`**, I want to configure bus routes with defined stops and pickup/drop times, so that transit schedules are organized.
-- **As a `transport_manager`**, I want to assign students to specific bus stops, so that vehicle capacity is never exceeded.
-- **As an `accountant`**, I want assigned student transport fares automatically included on monthly fee vouchers.
-- **As a `parent`**, I want to view my child's bus route, vehicle number, driver contact, and scheduled pickup time.
+- **As a `transport_manager`**, I want to define bus routes with scheduled pickup stops and pickup times, so that transit operations are organized.
+- **As a `transport_manager`**, I want to assign students to specific bus stops, so that vehicles do not exceed legal seating capacity.
+- **As an `accountant`**, I want student transport subscriptions automatically billed as auxiliary heads in monthly fee vouchers.
+- **As a `parent`**, I want to view my child's assigned bus number, driver phone number, and scheduled pickup time.
 
 #### 14.3 Concrete Business Rules
-1. Each vehicle has a strictly enforced `seating_capacity`. Student assignments cannot exceed vehicle capacity.
-2. Transport stops define morning pickup time, afternoon drop time, and a monthly `fare_amount` in minor units.
-3. Assigning an enrolled student to a transport stop creates a recurring billing rule that automatically appends the transport fee head during monthly voucher generation in Module 7.
-4. Unsubscribing a student mid-month prorates or terminates subsequent billing cycles based on school policy.
+1. Vehicles track registration number, chassis number, total seating capacity, insurance expiration, and fitness certificate date.
+2. Route stops have defined geographic coordinates, sequence numbers, and monthly fare amounts.
+3. Student transport subscriptions link `enrollment_id` to `route_stop_id`.
+4. Generating monthly fee vouchers automatically adds a line item for the subscribed stop fare under the `transport` fee head.
+5. Total assigned students per vehicle cannot exceed `seating_capacity * 1.10` (strict 10% safety margin cap).
 
 #### 14.4 Edge Cases & Failure Modes
-- Route assignment attempted for bus at full capacity: System rejects assignment: "Vehicle capacity of 40 students reached."
-- Vehicle undergoes emergency maintenance: Transport manager triggers SMS alert to all parents on that route with replacement vehicle details.
+- Student unsubscribes mid-month: System prorates remaining days or bills full month based on school policy setting.
+- Bus vehicle undergoes emergency maintenance: Transport manager triggers substitute vehicle re-assignment, dispatching push notifications to affected parents.
 
 #### 14.5 Acceptance Criteria Checklist
-- [ ] Fleet management captures vehicle registration, insurance expiry, fitness certificate, and driver phone.
-- [ ] Route builder creates ordered stops with GPS coordinates and scheduled arrival times.
-- [ ] Student allocation interface validates vehicle capacity limits.
-- [ ] Monthly fee generator automatically includes route stop fare on student voucher.
-- [ ] Route passenger manifest exports as printable PDF for bus attendants.
+- [ ] Vehicle directory tracks license plate, capacity, driver assignment, and document expirations.
+- [ ] Route management interface defines sequential stops, GPS coordinates, and arrival times.
+- [ ] Student transport subscription manager assigns pickup/drop-off stops with capacity validation.
+- [ ] Monthly fee generator automatically includes transport fee line item from active subscriptions.
+- [ ] Printable bus passenger roster formats student photo, class, stop name, and emergency contact numbers.
 
 ---
 
-### Module 15: Hostel (P2)
+### Module 15: Hostel / Dormitory (P2)
 
 #### 15.1 Overview & Scope
-Residential boarding school management. Manages hostel buildings, floors, room configurations, bed capacity, room allocations, student check-in/out logs, warden assignments, gate passes, visitor logs, and automated room and mess fee billing.
+Residential campus accommodation management. Manages hostel buildings, room types, bed inventories, student bed allocations, hostel warden assignments, visitor logs, and monthly hostel fee billing.
 
 #### 15.2 User Stories
-- **As a `hostel_warden`**, I want to configure rooms and beds, so that boarding capacity is managed efficiently.
-- **As a `hostel_warden`**, I want to allocate students to beds, track check-in dates, and issue digital gate passes for weekend leaves.
-- **As an `accountant`**, I want monthly hostel room and mess fees automatically billed to residential students.
-- **As a `parent`**, I want to view my child's hostel room assignment, warden contact, and gate pass approvals.
+- **As a `hostel_warden`**, I want to configure hostel blocks, rooms, and bed capacities, so that residential accommodations are tracked.
+- **As a `hostel_warden`**, I want to allocate students to available beds, ensuring gender segregation across distinct hostel buildings.
+- **As an `accountant`**, I want room boarding and meal plan charges automatically integrated into monthly student fee vouchers.
+- **As a `hostel_warden`**, I want to record residential visitor check-ins and check-outs, so that student safety is audited.
 
 #### 15.3 Concrete Business Rules
-1. Hostel rooms have room types: `single`, `double`, `dormitory` with fixed `bed_count`.
-2. A bed cannot have more than one active student allocation at the same time.
-3. Residential students are flagged with `is_hostelite = true`, which links monthly hostel rent and mess fee heads into Module 7 voucher generation.
-4. Gate passes require parent consent and warden approval before a student can leave premises.
+1. Hostels have a strict `gender` designation (`boys`, `girls`). Allocating a student of mismatched gender is rejected by database constraints.
+2. Room records define bed capacity (e.g., 2-seater, 4-seater, dormitory). Each bed is assigned a unique identifier.
+3. Bed allocation links `enrollment_id` to `bed_id` with start and end dates.
+4. Active allocations generate recurring hostel accommodation and meal charges in Module 7 (Fees).
+5. Vacating a room requires a formal clearance inspection, validating that all room assets are intact.
 
 #### 15.4 Edge Cases & Failure Modes
-- Student withdraws from school while holding active hostel bed: Withdrawal clearance requires hostel warden clearance sign-off.
-- Student requests gate pass during examination days: System flags warning to warden indicating ongoing exam dates.
+- Attempting to allocate an already occupied bed: Allocation engine enforces unique constraint on `bed_id` for active dates, preventing double-booking.
+- Student suspended or expelled: System prompts hostel checkout workflow, freeing the bed inventory.
 
 #### 15.5 Acceptance Criteria Checklist
-- [ ] Hostel building master tracks floors, room numbers, bed IDs, and AC/Non-AC status.
-- [ ] Bed allocation matrix visualizes occupied and available beds with student photo cards.
-- [ ] Digital gate pass tracks departure time, expected return, destination, and parent approval status.
-- [ ] Visitor log records guest CNIC/ID, relation to student, and entry/exit timestamps.
-- [ ] Monthly hostel fee heads automatically integrate into bulk fee generation.
+- [ ] Hostel building and room hierarchy tracks capacity, amenities (AC/Non-AC), and warden assignments.
+- [ ] Visual bed allocation grid displays room occupancy with color-coded bed availability.
+- [ ] Gender segregation validation blocks misallocated student room assignments.
+- [ ] Recurring hostel boarding and mess charges integrate directly into monthly billing.
+- [ ] Visitor check-in/out log records visitor identity, relationship, entry/exit times, and vehicle number.
 
 ---
 
 ### Module 16: Certificates and Cards (P1)
 
 #### 16.1 Overview & Scope
-Document and credential issuance engine. Features dynamic template builders with merge tokens, issuing formal Leaving/Transfer Certificates (TC), Character Certificates, Bonafide Certificates, student/staff ID cards, and exam admit cards with verification barcodes.
+Institutional credential and document generation engine. Generates School Leaving / Transfer Certificates (SLC/TC), Character Certificates, Bonafide Student Certificates, Student/Staff ID Cards, and Examination Admit Cards using dynamic token-based templates and printable PDF output.
 
 #### 16.2 User Stories
-- **As a `school_admin`**, I want to generate Transfer Certificates (TC) with automated student history, so that departing students receive formal documentation.
-- **As a `school_admin`**, I want to design and print student ID cards in bulk with school branding and barcodes.
-- **As an `employer` or `foreign institution`**, I want to scan the QR code on a certificate to verify its authenticity on the school's public verification page.
+- **As a `school_admin`**, I want to generate a formal Transfer Certificate (SLC/TC) with an automated serial number, so that departing students receive official records.
+- **As a `school_admin`**, I want to print barcode-enabled Student ID Cards in bulk, so that students can use them for attendance and library access.
+- **As a `school_admin`**, I want to generate Bonafide / Character Certificates using customizable text templates, so that clerical tasks are automated.
+- **As an `accountant`**, I want the system to block certificate generation if a student has unpaid fee dues, so that institutional debt is cleared before departure.
 
 #### 16.3 Concrete Business Rules
-1. Certificates utilize sequential certificate numbers from `document_sequences` (e.g., `TC-2026-0042`).
-2. Merge tokens dynamically populate student data: `{{student_name}}`, `{{father_name}}`, `{{admission_no}}`, `{{class}}`, `{{roll_no}}`, `{{dob}}`, `{{conduct}}`, `{{issue_date}}`.
-3. Issuing a Transfer Certificate (TC) requires prior financial clearance (0 ledger balance in Module 7) and automatically sets student status to `transferred`.
-4. Every issued certificate generates a unique verification hash encoded into a QR code linking to `https://[school_domain]/verify/[hash]`.
+1. Certificates use gapless document numbering generated from `document_sequences` per `school_id`.
+2. Transfer Certificate issuance strictly requires complete institutional clearance (Library: 0 unreturned books; Fees: 0 outstanding balance; Hostel: vacated).
+3. Issuing a Transfer Certificate automatically transitions the student enrollment status to `'transferred'` or `'withdrawn'`.
+4. Certificate templates support merge variables: `{{student_name}}`, `{{admission_number}}`, `{{father_name}}`, `{{class_name}}`, `{{date_of_birth}}`, `{{conduct}}`.
+5. Issued certificates store an immutable snapshot of generated text and a verification QR code URL (`/verify-cert/[uuid]`).
 
 #### 16.4 Edge Cases & Failure Modes
-- Attempting to issue a TC to a student with pending fee arrears: System blocks issuance: "Cannot issue Transfer Certificate. Outstanding fee balance of \$120.00."
-- Re-printing a lost certificate: System marks print as "DUPLICATE COPY" with original issue date and incremented print counter.
+- Attempting to issue a certificate with unpaid fees: Generation wizard blocks with error: "Outstanding balance of \$150.00 found. Settle dues before issuing Transfer Certificate."
+- Re-printing an existing certificate: Layout prints identical serial number with `"DUPLICATE COPY"` watermark and incremented print count.
 
 #### 16.5 Acceptance Criteria Checklist
-- [ ] Visual certificate designer allows configuring background frames, logos, signature lines, and merge tokens.
-- [ ] Bulk ID card generator renders CR80 card dimensions (front and back) with photo and barcode.
-- [ ] Transfer Certificate generation checks financial clearance and closes enrollment.
-- [ ] Public verification URL validates certificate authenticity without requiring login.
-- [ ] Certificate issuance log tracks recipient, certificate type, serial number, and issuing admin.
+- [ ] Visual template editor allows custom text, variable merge tags, borders, and school crest positioning.
+- [ ] Fee and library clearance validator gates Transfer Certificate issuance.
+- [ ] Gapless sequence numbering guarantees strictly monotonic certificate serials.
+- [ ] Public verification endpoint validates scanned QR code against authentic issued certificate record.
+- [ ] Bulk Student ID Card generator formats printable 8-per-sheet CR-80 card layouts with barcodes.
 
 ---
 
 ### Module 17: Admissions and Enquiries (P1)
 
 #### 17.1 Overview & Scope
-Admissions CRM and front-office inquiry pipeline. Provides public online admission application links, tracks prospective student leads, schedules entrance tests and interviews, scores entrance exams, and converts accepted applicants into enrolled students with registration fee billing.
+Prospective student pipeline and CRM. Covers walk-in/online admission inquiries, prospect status tracking, follow-up scheduling, entrance test scheduling and marks entry, interview evaluations, and one-click conversion into active enrolled students with initial fee voucher generation.
 
 #### 17.2 User Stories
-- **As a `parent`**, I want to submit an online admission form on the school's website, upload required documents, and pay the application fee.
-- **As an `admissions_officer`**, I want to track prospective leads across an inquiry pipeline (Inquiry $\to$ Test Scheduled $\to$ Interviewed $\to$ Offered $\to$ Enrolled).
-- **As an `admissions_officer`**, I want to convert an accepted applicant to an enrolled student in one click, transferring all demographic data into Module 2 without re-typing.
+- **As an `admissions_officer`**, I want to log prospective student inquiries with source (walk-in, website, referral), so that enrollment leads are managed.
+- **As an `admissions_officer`**, I want to schedule entrance tests and interviews, sending automated SMS reminders to parents.
+- **As an `admissions_officer`**, I want to record entrance test marks, so that admission decisions are based on academic criteria.
+- **As a `school_admin`**, I want to convert an accepted applicant into an enrolled student in one click, generating their admission number and initial invoice.
 
 #### 17.3 Concrete Business Rules
-1. Public admission applications generate a tracking reference number (e.g., `APP-2026-0189`).
-2. Inquiry statuses follow a strict pipeline: `lead`, `inquiry`, `test_scheduled`, `interviewed`, `offered`, `enrolled`, `rejected`, `withdrawn`.
-3. Entrance test scores are recorded out of 100 with pass/fail determination.
-4. Converting an applicant to `enrolled`:
-   - Creates a new record in `students`.
-   - Creates a new record in `student_enrollments` for the target session, class, and section.
-   - Generates an admission invoice in Module 7 including one-time Admission and Registration fee heads.
+1. Inquiry status states: `inquiry`, `applied`, `test_scheduled`, `interview_scheduled`, `accepted`, `rejected`, `enrolled`.
+2. Online admission applications submitted via Module 23 (Public School Page) insert into `admissions_pipeline` with source `'web'`.
+3. Converting an applicant to `enrolled` executes an atomic database transaction:
+   - Creates row in `students`.
+   - Creates row in `student_enrollments` for active session.
+   - Generates initial admission and registration fee voucher in Module 7.
+4. Duplicate inquiries by phone number or national ID within 90 days are flagged to prevent pipeline inflation.
 
 #### 17.4 Edge Cases & Failure Modes
-- Applicant attempts to submit form without mandatory birth certificate attachment: Form validation blocks submission until file is uploaded.
-- Duplicate inquiry submitted with same parent phone and child name: System detects potential duplicate and links to existing lead record.
+- Applicant accepted but never deposits admission fee: Application remains in `accepted` status until configured expiration date (e.g., 14 days), after which status transitions to `expired`.
+- Incomplete document upload during online application: System saves draft application, emailing secure resume link to parent.
 
 #### 17.5 Acceptance Criteria Checklist
-- [ ] Embeddable/public online admission form collects student info, parent info, and document uploads.
-- [ ] Admissions Kanban board displays leads across pipeline stages with drag-and-drop status updates.
-- [ ] Interview and test scheduler sends automated confirmation SMS/email to parents.
-- [ ] One-click conversion button transforms approved application into enrolled student with allocated roll number.
-- [ ] Lead source tracking report analyzes conversions by channel (Social Media, Walk-in, Referral).
+- [ ] Admissions Kanban board organizes inquiries across stages (Inquiry $\to$ Test $\to$ Interview $\to$ Enrolled).
+- [ ] Automated SMS reminder dispatches to parents 24 hours prior to scheduled entrance tests.
+- [ ] Entrance test score sheet captures subject marks and generates merit ranking.
+- [ ] One-click enrollment conversion auto-populates student profile and creates initial fee challan.
+- [ ] Conversion rate analytics track lead source effectiveness and cohort yield.
 
 ---
 
 ### Module 18: Reports and Dashboards (P0 Basic, P1 Full)
 
 #### 18.1 Overview & Scope
-Executive business intelligence and analytical reporting. Delivers role-tailored dashboards (`super_admin`, `school_admin`, `accountant`, `teacher`, `student`, `parent`), interactive KPI metric cards, tabular report generators with saved filters, and export engines (Excel XLSX, PDF, Print).
+Institutional business intelligence and analytics suite. Role-specific real-time KPI dashboards, executive summaries, financial collection reports, academic result analysis, student attendance trends, staff workload distribution, and scheduled PDF/Excel exports.
 
 #### 18.2 User Stories
-- **As a `school_admin`**, I want an executive dashboard displaying total students, daily student attendance %, staff present count, monthly fee collection progress, and net profit.
-- **As an `accountant`**, I want to generate a Fee Collection Summary report grouped by class and payment method, exportable to Excel.
-- **As a `teacher`**, I want to view class performance metrics comparing exam averages across sections.
-- **As a `super_admin`**, I want a global platform dashboard tracking total active schools, monthly recurring revenue (MRR), and system resource usage.
+- **As a `school_admin`**, I want a centralized dashboard showing total enrolled students, staff attendance today, fees collected this month, and pending inquiries.
+- **As an `accountant`**, I want to generate a Daily Fee Collection Summary broken down by payment mode (Cash, Bank, Online), so that banking reconciliation is instantaneous.
+- **As a `teacher`**, I want to view my class's average test scores and identify struggling students, so that I can provide targeted interventions.
+- **As a `super_admin`**, I want global SaaS metrics showing active tenant counts, Monthly Recurring Revenue (MRR), and system error rates.
 
 #### 18.3 Concrete Business Rules
-1. Dashboard metrics respect user role permissions and tenant RLS scoping at all times.
-2. Financial charts and numbers are rounded to standard minor units and displayed in the school's configured currency.
-3. Heavy aggregate reports (e.g., whole-school annual attendance tabulation) utilize materialized database views or cached background calculations to prevent UI lag.
-4. Data exports (XLSX, PDF) format headers with school logo, report name, generation timestamp, and generating user.
+1. Dashboard metrics respect multi-tenant RLS; queries are filtered by `school_id`.
+2. Heavy analytic aggregates (e.g., multi-year fee trends, school-wide GPA distributions) use pre-aggregated materialized views refreshed periodically via `pg_cron`.
+3. Financial reports show exact minor-unit sums matching ledger totals (`SUM(amount)`).
+4. Export engine streams large datasets as CSV or formatted Excel files without holding full datasets in Edge Function memory.
+5. Scheduled reports can be configured to email weekly PDF summaries to school administrators.
 
 #### 18.4 Edge Cases & Failure Modes
-- Exporting report with 50,000+ rows: System delegates generation to `job_queue` and notifies user when downloadable file is ready in Storage.
-- Attempting to view financial reports as a Teacher: System rejects request with HTTP 403 Forbidden.
+- Database under heavy load during report generation: Complex analytics queries execute against read replicas or with `SET statement_timeout = '30s'` to protect transactional operations.
+- Exporting dataset exceeding 50,000 rows: Job is dispatched to background `job_queue`; user receives toast notification with download link upon completion.
 
 #### 18.5 Acceptance Criteria Checklist
-- [ ] Executive KPI cards display Total Students, Staff Attendance, Fee Collection %, and Net Balance.
-- [ ] Interactive charts visualize Monthly Income vs Expense trends and Student Demographics by Gender/Class.
-- [ ] Data tables provide server-side sorting, column filtering, search, and pagination.
-- [ ] One-click export to CSV, Excel (XLSX), and PDF formatted for standard A4 printing.
-- [ ] Saved filter presets allow users to store and reload custom report parameters.
+- [ ] School Admin dashboard renders student enrollment count, daily attendance gauge, and monthly revenue graph.
+- [ ] Fee Collection Report filters by date range, payment mode, cashier, and class with accurate minor-unit totals.
+- [ ] Exam Result Analysis charts class-wise subject averages, pass percentages, and grade distributions.
+- [ ] Attendance analytics highlight chronic absenteeism (<75% attendance) across sections.
+- [ ] Export engine produces formatted PDF and Excel broadsheets with school header and pagination.
 
 ---
 
 ### Module 19: Roles and Permissions (P0)
 
 #### 19.1 Overview & Scope
-Enterprise authorization and governance engine. Supports built-in system roles (`super_admin`, `school_admin`, `accountant`, `teacher`, `student`, `parent`), custom user roles (e.g., `vice_principal`, `receptionist`), granular module-action permission matrices (view, create, edit, delete, approve, export), per-user permission overrides, and an immutable audit log.
+Enterprise Role-Based Access Control (RBAC). System-defined built-in roles (`super_admin`, `school_admin`, `accountant`, `teacher`, `student`, `parent`), custom user roles, granular module permissions (`view`, `create`, `edit`, `delete`, `approve`, `export`), and an immutable database audit log.
 
 #### 19.2 User Stories
-- **As a `school_admin`**, I want to create a custom role (e.g., "Front Desk Receptionist") with permissions limited to Admissions and Inquiries, so that staff access is strictly controlled.
-- **As a `school_admin`**, I want to review an immutable audit log of who edited a student's marks or deleted a fee voucher, including timestamps and previous values.
-- **As a `super_admin`**, I want to enforce strict role separation so that accountants can never view student exam grades or medical records.
+- **As a `school_admin`**, I want to create custom roles (e.g., "Exam Coordinator", "Vice Principal") with specific permission toggles, so that staff have appropriate access.
+- **As a `school_admin`**, I want to review an audit log of who changed student marks or deleted fee records, so that institutional accountability is maintained.
+- **As a `super_admin`**, I want to impersonate a school admin for troubleshooting, ensuring the session is strictly time-limited and fully audited.
 
 #### 19.3 Concrete Business Rules
-1. Authorization is enforced at the database level via Postgres RLS policies querying JWT claims (`app_role`, `school_id`).
-2. Granular permission format: `module:action` (e.g., `fees:create`, `marks:approve`, `students:export`).
-3. Sensitive actions generate mandatory records in `audit_logs`:
-   - Fee voucher cancellations or modifications.
-   - Marks updates after exam lock.
-   - Student status changes (withdrawal, struck off).
-   - Staff salary modifications.
-   - User role or permission edits.
-   - Super admin tenant impersonation sessions.
-4. Audit log rows are strictly append-only; database denies `UPDATE` or `DELETE` operations on `audit_logs`.
+1. System roles cannot be renamed or deleted. Custom roles inherit baseline multi-tenant scoping.
+2. Every sensitive database mutation (`UPDATE`, `DELETE`, critical `INSERT`) generates a row in `audit_logs` storing user UUID, timestamp, table name, record ID, old values (JSONB), and new values (JSONB).
+3. Permissions are evaluated server-side in Supabase RLS policies and Next.js middleware; client-side UI toggles are strictly cosmetic.
+4. Accountants are barred from viewing academic exam marks or student medical history. Teachers are barred from viewing school fee ledger entries.
+5. School users are bound by `UNIQUE(school_id, user_id)`: one active role per user per school in V1.
 
 #### 19.4 Edge Cases & Failure Modes
-- School admin attempts to revoke `school_admin` role from their own account: System blocks action to prevent administrative lockout.
-- User makes an unauthorized API request: RLS policy returns 0 rows; application returns 403 Forbidden and logs security warning.
+- School admin attempts to revoke their own administrative privileges: System blocks action with validation error: "Cannot revoke school_admin permission from your own active account."
+- Permission check fails on API call: Endpoint returns HTTP 403 Forbidden with structured error code `INSUFFICIENT_PERMISSIONS`.
 
 #### 19.5 Acceptance Criteria Checklist
-- [ ] Built-in roles pre-configured with industry standard defaults.
-- [ ] Custom role builder allows toggling view, create, edit, delete, approve, and export across all modules.
-- [ ] Per-user override capability allows granting or revoking specific permissions for an individual staff member.
-- [ ] Immutable audit log captures user UUID, IP address, action, target entity ID, old state JSONB, and new state JSONB.
-- [ ] Strict row-level scoping guarantees teachers see only their assigned classes, parents see only their linked children.
+- [ ] Custom Role Builder UI provides permission checkboxes across all 23 modules.
+- [ ] User role assignment updates Supabase Auth JWT custom claims immediately.
+- [ ] Database RLS policies reject unauthorized reads and writes regardless of client payload.
+- [ ] Audit log viewer displays chronological mutation history with visual JSON diff inspection.
+- [ ] Super admin impersonation writes audit log entries with explicit rationale and auto-expires after 60 minutes.
 
 ---
 
 ### Module 20: Portals (P0)
 
 #### 20.1 Overview & Scope
-Tailored, role-specific user portals providing dedicated user experiences:
-1. **Student Portal**: Timetable, personal attendance, report cards, homework, fee slips, circulars.
-2. **Parent Portal**: Multi-child switchboard, consolidated fee payments, attendance notifications, diary, teacher messaging.
-3. **Teacher Portal**: Class schedules, fast attendance marking, exam marks entry, homework grading, student search.
-4. **Accountant Portal**: Single-key fast fee collection POS interface, barcode scanner input, receipt printing, daily closing.
+Tailored digital experiences for each user persona. Covers Web and Mobile portal interfaces for Student, Parent (multi-child switchboard), Teacher (attendance & grading POS), Accountant (rapid fee collection terminal), and School Admin.
 
 #### 20.2 User Stories
-- **As a `parent`**, I want to switch between my three children in one click without re-logging, so that I can easily monitor each child.
-- **As an `accountant`**, I want a barcode-assisted fee collection terminal where scanning a voucher instantly opens payment details and prints a receipt upon hitting Enter.
-- **As a `teacher`**, I want a clean portal optimized for tablet and mobile, so that I can manage classroom activities on the go.
+- **As a `parent`**, I want a single mobile login that allows me to switch between my enrolled children, so that I can see their respective attendance, marks, and fees without logging out.
+- **As an `accountant`**, I want an optimized desktop POS collection screen with keyboard shortcuts and barcode scanning, so that peak fee collection lines move rapidly.
+- **As a `teacher`**, I want a mobile-friendly attendance and diary entry screen, so that I can update records while walking around the classroom.
+- **As a `student`**, I want to view my upcoming exam dates, homework deadlines, and report cards in a clean, distraction-free mobile portal.
 
 #### 20.3 Concrete Business Rules
-1. Multi-Child Switchboard: Parent session maintains active `selected_child_enrollment_id`. Changing children updates context without re-authenticating.
-2. Accountant Fast Collection: Supports full keyboard-only navigation (Scan Barcode $\to$ Enter $\to$ F9 Cash Collect $\to$ Print Receipt).
-3. Student access is locked if administrative hold (`is_portal_locked = true`) is placed due to extreme fee default.
+1. Parent portal implements a persistent Child Switcher; changing active child updates context across all screens.
+2. Web portals use Supabase SSR secure cookie authentication; mobile portals use hardware-backed encrypted token storage.
+3. Accountant POS interface supports full keyboard navigation (F2 = Scan, F4 = Cash, Enter = Submit & Print).
+4. All portal interfaces are responsive from 360px viewport width up to 4K displays.
+5. Offline mobile caching allows teachers to mark attendance and draft diary entries in areas with poor internet connectivity, syncing when online.
 
 #### 20.4 Edge Cases & Failure Modes
-- Parent with children in two different schools under the platform: Multi-tenant JWT supports multiple school links; parent chooses school branch from portal header.
-- Student attempts to access parent-specific fee payment settings: Portal routes enforce role boundaries, denying access.
+- Parent with children in two different schools: System displays tenant switchboard, allowing parent to select school tenant before loading family records.
+- Network interruption during mobile attendance marking: Local SQLite/WatermelonDB stores drafted records, syncing automatically with exponential backoff upon reconnection.
 
 #### 20.5 Acceptance Criteria Checklist
-- [ ] Parent portal header features child switcher dropdown displaying child photo, name, class, and attendance badge.
-- [ ] Accountant POS screen supports rapid barcode scan, amount tender calculator, and ESC/shortcut controls.
-- [ ] Teacher mobile portal provides bottom-navigation bar for Quick Attendance, Marks, Homework, and Diary.
-- [ ] Student portal displays daily schedule countdown and due homework cards.
-- [ ] Session timeout and token refreshing handle mobile background state seamlessly.
+- [ ] Parent multi-child switchboard toggles active child context instantly across web and mobile.
+- [ ] Accountant fee collection POS screen completes payment receipt in under 5 keystrokes.
+- [ ] Teacher mobile portal provides dedicated attendance, marks entry, and student diary interfaces.
+- [ ] Student portal provides visual timetable, report card downloads, and homework submission flows.
+- [ ] All portal screens implement responsive layouts, dark/light theme switching, and WCAG AA accessibility.
 
 ---
 
-### Module 21: Settings and Data (P0 Partial)
+### Module 21: Settings and Data Management (P0/P1)
 
 #### 21.1 Overview & Scope
-Institutional configuration, localization, third-party integrations, and disaster recovery. Manages school profile, logos, signatures, letterhead templates, academic grading configuration, SMS/WhatsApp gateway credentials, payment gateway credentials, multi-language internationalization (i18n), Right-to-Left (RTL) layout, and full database export/backup.
+Institutional configuration and data maintenance. School profile branding, academic calendar settings, fee head templates, payment gateway credentials, SMS gateway configuration, localization (timezone, currency, RTL), automated database backups, and bulk data import/export utilities.
 
 #### 21.2 User Stories
-- **As a `school_admin`**, I want to configure our school letterhead, logo, and principal digital signature, so that all generated PDFs are officially branded.
-- **As a `school_admin`**, I want to toggle language between English, Arabic, and Urdu with complete RTL support, so that staff and parents can use their native language.
-- **As a `school_admin`**, I want to export all school data to a ZIP file containing structured Excel spreadsheets, so that we retain full data ownership.
+- **As a `school_admin`**, I want to upload our school crest, official stamp, and principal signature, so that all printed documents are branded.
+- **As a `school_admin`**, I want to configure our school's timezone and currency, so that dates and invoices display in our local standard.
+- **As a `school_admin`**, I want to export full institutional data backups, so that we have complete data sovereignty.
+- **As a `school_admin`**, I want to configure our Stripe/Razorpay payment gateway credentials, so that online fees deposit directly into our bank account.
 
 #### 21.3 Concrete Business Rules
-1. Internationalization (i18n) covers 100% of UI strings. Hardcoded text is prohibited.
-2. RTL mode activates automatically when Arabic or Urdu is selected, switching layout flex directions and typography.
-3. Third-party credentials (SMS API keys, Stripe/Razorpay secrets) are encrypted at rest using AES-GCM-256 before storage in `school_settings`.
-4. Automated daily database backups are stored in isolated encrypted cloud storage.
+1. School settings are stored in `schools` and `school_settings` with schema validation.
+2. All date and time stamps are stored in UTC; client views format dates in `schools.timezone`.
+3. Currency display is governed by `schools.default_currency`.
+4. Payment gateway and SMS credentials are encrypted at rest using PostgreSQL `pgcrypto` or Supabase Vault.
+5. Bulk data export produces a password-protected ZIP archive containing CSV tables and uploaded student documents.
 
 #### 21.4 Edge Cases & Failure Modes
-- Invalid API credentials entered for SMS gateway: Settings modal provides a "Test Connection" button that validates credentials with a test ping before saving.
-- Importing backup data from another school: Database schema enforces tenant UUID validation, preventing cross-tenant data corruption.
+- Admin enters invalid payment gateway API keys: System executes a lightweight test verification transaction; if validation fails, configuration is rejected with descriptive error.
+- Changing school timezone mid-year: Existing historical UTC timestamps remain unchanged; UI display offsets update cleanly.
 
 #### 21.5 Acceptance Criteria Checklist
-- [ ] Institutional profile editor manages name, logo, banner, motto, address, phone, email, currency, and timezone.
-- [ ] Instant language toggle supports English, Urdu, and Arabic with bidirectional RTL layout flipping.
-- [ ] Secure settings vault stores API credentials for SMS, WhatsApp, and Payment gateways with "Test Ping" tools.
-- [ ] One-click Full Data Export generates downloadable ZIP package of school data in Excel format.
-- [ ] Print template settings allow custom margins, header/footer text, and signature stamps for vouchers and reports.
+- [ ] School branding settings allow uploading logo, header banner, digital stamp, and signature.
+- [ ] Localization panel configures timezone, currency code, date format (DD/MM/YYYY vs MM/DD/YYYY), and language.
+- [ ] Integration manager configures and tests SMS, WhatsApp, and Payment gateway adapters.
+- [ ] Complete school data export utility packages student, staff, and financial data into secure ZIP archive.
+- [ ] Configuration changes are audited with timestamp and user UUID.
 
 ---
 
 ### Module 22: SaaS Layer (P1)
 
 #### 22.1 Overview & Scope
-Multi-tenant platform operations and subscription monetization. Manages school onboarding, subscription plans (Starter, Pro, Enterprise), student/staff account quotas, automated SaaS subscription billing via `PaymentGatewayAdapter`, super-admin command center, audited school impersonation, custom domains, and platform telemetry.
+Multi-tenant platform operations console for the SaaS provider (`super_admin`). Covers tenant provisioning, subscription package management, student quota enforcement, billing and Stripe invoice generation, global tenant health monitoring, and audited school impersonation.
 
 #### 22.2 User Stories
-- **As a `super_admin`**, I want to onboard a new school, assign a subscription plan, and provision their database tenant in under 60 seconds.
-- **As a `super_admin`**, I want to securely impersonate a school admin to troubleshoot an issue, with every action logged in a tamper-proof audit trail.
-- **As a `super_admin`**, I want schools exceeding their subscription student limit to be prompted for an automated plan upgrade.
-- **As a `school_admin`**, I want to map our custom domain (`portal.schoolname.edu`) to our ERP portal.
+- **As a `super_admin`**, I want to provision a new school tenant in seconds, so that new customer onboarding is frictionless.
+- **As a `super_admin`**, I want to define subscription plans with student and storage limits, so that schools are billed according to scale.
+- **As a `super_admin`**, I want to monitor platform health, active users, and database performance across all schools.
+- **As a `super_admin`**, I want to temporarily impersonate a school admin to resolve a technical support ticket, with complete audit logging.
 
 #### 22.3 Concrete Business Rules
 1. Platform Plans define strict quotas: `max_students`, `max_staff`, `storage_limit_mb`, and enabled feature flags.
@@ -1054,31 +1199,34 @@ Public-facing web landing page for each school tenant. Features customizable her
 
 ## 5. Verification and Acceptance Matrix
 
-| Module ID | Module Name | Priority | Worked Example Included | Testable Criteria Count | RLS Enforced |
+The following matrix catalogs verification criteria counts and architectural guarantees across all 23 platform modules. Testable Criteria Counts reflect the exact number of formal checklist verification items defined in each module's specification.
+
+| Module ID | Module Name | Priority | Worked Numerical Example Included | Testable Criteria Count | RLS Enforced |
 | :---: | :--- | :---: | :---: | :---: | :---: |
-| 1 | Academic Setup | P0 | N/A (Structural) | 5 | Yes |
-| 2 | Students | P0 | Section 3.7 (Promotion) | 5 | Yes |
-| 3 | Staff and HR | P0/P1 | Section 9.3 (Leave Proration) | 5 | Yes |
-| 4 | Attendance | P0/P1 | Section 4.3 (Attendance %) | 5 | Yes |
-| 5 | Timetable | P1 | N/A (Clash Rules) | 5 | Yes |
-| 6 | Exams and Results | P0/P1 | Sections 3.5 & 3.6 (GPA & Rank) | 5 | Yes |
-| 7 | Fees | P0 | Sections 3.1, 3.2, 3.3, 3.4 | 5 | Yes |
-| 8 | Accounts (V1) | P1 | N/A (Closing Formula) | 5 | Yes |
-| 9 | Payroll | P1 | Section 9.3 (Salary & Deductions) | 5 | Yes |
-| 10 | Communication | P0/P1 | N/A (Merge Logic) | 5 | Yes |
-| 11 | Learning | P1/P2 | N/A (Grading Flags) | 5 | Yes |
-| 12 | Library | P2 | Section 12.3 (Overdue Fine) | 5 | Yes |
-| 13 | Inventory | P2 | Section 13.3 (Stock Balance) | 5 | Yes |
-| 14 | Transport | P2 | Section 14.3 (Fare Billing) | 5 | Yes |
-| 15 | Hostel | P2 | Section 15.3 (Room Billing) | 5 | Yes |
-| 16 | Certificates and Cards | P1 | Section 16.3 (Sequence/Clearance) | 5 | Yes |
-| 17 | Admissions and Enquiries | P1 | Section 17.3 (Conversion) | 5 | Yes |
-| 18 | Reports and Dashboards | P0/P1 | Section 18.3 (Aggregation) | 5 | Yes |
-| 19 | Roles and Permissions | P0 | Section 19.3 (Audit Rules) | 5 | Yes |
-| 20 | Portals | P0 | Section 20.3 (POS & Switchboard) | 5 | Yes |
-| 21 | Settings and Data | P0/P1 | Section 3.8 (Rounding) | 5 | Yes |
-| 22 | SaaS Layer | P1 | Section 22.3 (Quotas & Billing) | 5 | Yes |
-| 23 | Public School Page | P2 | N/A (Public Routing) | 5 | Yes |
+| 1 | Academic Setup | P0 | N/A (Structural Schema) | 5 | Yes |
+| 2 | Students | P0 | Section 3.7 (Promotion Decision Table) | 5 | Yes |
+| 3 | Staff and HR | P0/P1 | Section 9.3 (Leave & Salary Proration) | 5 | Yes |
+| 4 | Attendance | P0/P1 | Section 4.3 (Attendance % Formula) | 5 | Yes |
+| 5 | Timetable | P1 | N/A (Clash Detection Invariants) | 5 | Yes |
+| 6 | Exams and Results | P0/P1 | Section 3.5, 3.6 & 6.3 (GPA, Ranking, Exempt) | 5 | Yes |
+| 7 | Fees | P0 | Sections 3.1, 3.2, 3.3, 3.4 & 3.9 (Ledger & Advance) | 12 | Yes |
+| 8 | Accounts (V1) | P1 | Section 8.3 (Daily Closing Reconciliation) | 5 | Yes |
+| 9 | Payroll | P1 | Section 9.3 (Net Salary & Unpaid Leave EMI) | 5 | Yes |
+| 10 | Communication | P0/P1 | N/A (Adapter Merge Variables) | 5 | Yes |
+| 11 | Learning / LMS | P1/P2 | N/A (Grading & Syllabus Tracking) | 5 | Yes |
+| 12 | Library | P2 | Section 12.3 (Overdue Fine Formulation) | 5 | Yes |
+| 13 | Inventory | P2 | Section 13.3 (Append-Only Stock Balance) | 5 | Yes |
+| 14 | Transport | P2 | Section 14.3 (Stop Fare & Fleet Capacity) | 5 | Yes |
+| 15 | Hostel | P2 | Section 15.3 (Room Billing & Segregation) | 5 | Yes |
+| 16 | Certificates and Cards | P1 | Section 16.3 (Sequence & Clearance Gate) | 5 | Yes |
+| 17 | Admissions and Enquiries | P1 | Section 17.3 (CRM Pipeline Conversion) | 5 | Yes |
+| 18 | Reports and Dashboards | P0/P1 | Section 18.3 (Materialized Aggregation) | 5 | Yes |
+| 19 | Roles and Permissions | P0 | Section 19.3 (Audit Triggers & RBAC) | 5 | Yes |
+| 20 | Portals | P0 | Section 20.3 (POS Terminal & Multi-Child) | 5 | Yes |
+| 21 | Settings and Data | P0/P1 | Section 3.8 (Half-Up Rounding & Tax) | 5 | Yes |
+| 22 | SaaS Layer | P1 | Section 22.3 (Quota Limiting & Impersonation) | 5 | Yes |
+| 23 | Public School Page | P2 | N/A (Public Routing & Lead Generation) | 5 | Yes |
+| **Total** | **All 23 Modules** | - | - | **122** | **100%** |
 
 ---
 
@@ -1086,4 +1234,4 @@ Public-facing web landing page for each school tenant. Features customizable her
 This Product Requirements Document (`PRD.md`) is complete, fully specified across all 23 modules with zero placeholders, and establishes the functional foundation of the ERP SaaS platform.
 
 Per the binding execution plan, work now stops. The agent is awaiting user instruction:
-`"next"` $\to$ will initiate authoring of **`docs/DATA_MODEL.md`**.
+`"next"` $\to$ will initiate authoring of **`docs/PERMISSIONS.md`**.
