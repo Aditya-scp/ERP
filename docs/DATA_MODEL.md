@@ -634,14 +634,10 @@ CREATE TABLE students (
     sr_number varchar(50), -- Scholar Register / General Register Number
     pen varchar(50), -- Permanent Education Number (UDISE+)
     apaar_id varchar(12), -- Automated Permanent Academic Account Registry (12 digits)
-    aadhaar_encrypted text, -- Stored encrypted at rest (only if school.collect_aadhaar = true)
-    aadhaar_masked varchar(12), -- Displayed masked e.g. XXXXXXXX1234
-    blood_group varchar(10),
     religion varchar(50),
     caste varchar(50),
     nationality varchar(50) DEFAULT 'Indian',
     special_category varchar(50),
-    medical_notes text,
     identification_mark text,
     photo_url text,
     address text,
@@ -665,6 +661,30 @@ CREATE UNIQUE INDEX idx_students_school_adm_active ON students(school_id, admiss
 CREATE INDEX idx_students_guardian ON students(school_id, primary_guardian_id);
 CREATE INDEX idx_students_status ON students(school_id, status);
 CREATE INDEX idx_students_user ON students(user_id);
+```
+
+#### Table: `student_sensitive_records` (Confidential & Medical Data)
+```sql
+CREATE TABLE student_sensitive_records (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
+    student_id uuid NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+    blood_group varchar(10),
+    medical_notes text,
+    national_id varchar(50),
+    aadhaar_encrypted text, -- Stored encrypted at rest (only if school.collect_aadhaar = true)
+    aadhaar_masked varchar(12), -- Displayed masked e.g. XXXXXXXX1234
+    disciplinary_notes text,
+    internal_guardian_notes text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    created_by uuid REFERENCES auth.users(id),
+    updated_by uuid REFERENCES auth.users(id),
+    deleted_at timestamptz,
+    UNIQUE (school_id, student_id)
+);
+
+CREATE INDEX idx_student_sensitive_lookup ON student_sensitive_records(school_id, student_id);
 ```
 
 #### Table: `student_guardians` (Guardian Link & Sibling Junction Table)
@@ -796,7 +816,6 @@ CREATE TABLE employees (
     last_name varchar(100), -- Optional
     gender gender_type NOT NULL,
     date_of_birth date NOT NULL,
-    national_id varchar(50) NOT NULL, -- PAN or Voter ID or Passport
     phone varchar(15) NOT NULL, -- E.164 +91 format (^\+91[6-9]\d{9}$)
     email varchar(255) NOT NULL,
     current_address text NOT NULL,
@@ -810,10 +829,6 @@ CREATE TABLE employees (
     employment_type employment_type NOT NULL DEFAULT 'full_time',
     qualification varchar(255) NOT NULL,
     experience_years numeric(4,1) NOT NULL DEFAULT 0.0,
-    basic_salary_minor_units bigint NOT NULL DEFAULT 0,
-    bank_name varchar(100),
-    bank_account_number varchar(100),
-    bank_ifsc varchar(20), -- Indian Financial System Code (e.g. HDFC0001234)
     status staff_status NOT NULL DEFAULT 'active',
     avatar_url text,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -826,6 +841,51 @@ CREATE TABLE employees (
 
 CREATE INDEX idx_employees_school_code ON employees(school_id, employee_code);
 CREATE INDEX idx_employees_user ON employees(user_id);
+```
+
+#### Table: `employee_sensitive_records` (Payroll, Bank & Statutory IDs)
+```sql
+CREATE TABLE employee_sensitive_records (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
+    employee_id uuid NOT NULL REFERENCES employees(id) ON DELETE RESTRICT,
+    pan_number varchar(20),
+    national_id varchar(50), -- PAN, Voter ID, Passport
+    basic_salary_minor_units bigint NOT NULL DEFAULT 0,
+    bank_name varchar(100),
+    bank_account_number varchar(100),
+    bank_ifsc varchar(20), -- Indian Financial System Code
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    created_by uuid REFERENCES auth.users(id),
+    updated_by uuid REFERENCES auth.users(id),
+    deleted_at timestamptz,
+    UNIQUE (school_id, employee_id)
+);
+
+CREATE INDEX idx_emp_sensitive_lookup ON employee_sensitive_records(school_id, employee_id);
+```
+
+#### Table: `employee_appraisals` (Confidential Performance Reviews)
+```sql
+CREATE TABLE employee_appraisals (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
+    employee_id uuid NOT NULL REFERENCES employees(id) ON DELETE RESTRICT,
+    appraisal_year integer NOT NULL,
+    rating numeric(3,2) NOT NULL, -- e.g. 4.50 out of 5.00
+    performance_notes text,
+    evaluated_by uuid NOT NULL REFERENCES employees(id) ON DELETE RESTRICT,
+    evaluated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    created_by uuid REFERENCES auth.users(id),
+    updated_by uuid REFERENCES auth.users(id),
+    deleted_at timestamptz,
+    UNIQUE (school_id, employee_id, appraisal_year)
+);
+
+CREATE INDEX idx_emp_appraisals_lookup ON employee_appraisals(school_id, employee_id);
 ```
 
 #### Table: `leave_types`
@@ -1254,6 +1314,8 @@ CREATE TYPE fee_fine_mode AS ENUM ('fixed_amount', 'per_day');
 CREATE TYPE grace_fine_mode AS ENUM ('incremental', 'retroactive');
 CREATE TYPE fee_voucher_status AS ENUM ('unpaid', 'partially_paid', 'paid', 'cancelled');
 CREATE TYPE fee_voucher_kind AS ENUM ('monthly', 'one_time');
+CREATE TYPE fee_approval_type AS ENUM ('refund', 'adjustment', 'discount');
+CREATE TYPE fee_approval_status AS ENUM ('pending', 'approved', 'rejected');
 CREATE TYPE allocation_bucket AS ENUM ('arrears', 'fine', 'tuition', 'auxiliary', 'optional');
 CREATE TYPE fee_ledger_entry_type AS ENUM (
     'charge',
@@ -1535,6 +1597,31 @@ CREATE TABLE fee_receipts (
 CREATE INDEX idx_fee_receipts_voucher ON fee_receipts(school_id, fee_voucher_id);
 CREATE INDEX idx_fee_receipts_ledger ON fee_receipts(school_id, ledger_entry_id);
 CREATE INDEX idx_fee_receipts_date ON fee_receipts(school_id, payment_date);
+```
+
+#### Table: `fee_approval_requests` (Maker-Checker Flow)
+```sql
+CREATE TABLE fee_approval_requests (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
+    request_type fee_approval_type NOT NULL,
+    status fee_approval_status NOT NULL DEFAULT 'pending',
+    enrollment_id uuid NOT NULL REFERENCES student_enrollments(id) ON DELETE RESTRICT,
+    fee_voucher_id uuid REFERENCES fee_vouchers(id) ON DELETE RESTRICT,
+    amount_minor_units bigint NOT NULL,
+    reason text NOT NULL,
+    requested_by uuid NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+    requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    reviewed_by uuid REFERENCES auth.users(id) ON DELETE RESTRICT,
+    reviewed_at timestamptz,
+    rejection_reason text,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX idx_fee_approval_requests_school_status ON fee_approval_requests(school_id, status);
+CREATE INDEX idx_fee_approval_requests_enrollment ON fee_approval_requests(school_id, enrollment_id);
 ```
 
 > [!NOTE]
