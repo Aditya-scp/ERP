@@ -16,6 +16,31 @@ ERP is a multi-tenant school management software-as-a-service (SaaS) platform en
 8. **Job Queue & Scheduling**: Asynchronous bulk operations (fee voucher generation, exam rank tabulations, mass notifications, report exports) utilize an internal `job_queue` table executed via `pg_cron` triggers and Supabase Edge Functions with row locking and exponential backoff.
 9. **Gapless Document Sequences**: Fee vouchers, payment receipts, and formal school certificates utilize dedicated sequence counter tables (`document_sequences`) with row-level locks (`SELECT ... FOR UPDATE`) to guarantee strictly monotonic, gapless numbering.
 10. **Data Auditability & Soft Deletion**: Standard audit columns (`created_at`, `updated_at`, `created_by`, `updated_by`) are enforced across all tables. Tables representing core academic, student, and financial records implement soft deletion via `deleted_at timestamptz`.
+11. **India Localization Defaults**:
+    - Currency is pre-selected as `INR` (Indian Rupee minor units = paise, ₹1.00 = 100 paise) for Indian schools, required at school creation, and permanently locked once the first fee voucher or fee ledger entry is recorded. No other fallback.
+    - Timezone defaults to `Asia/Kolkata`.
+    - Date format defaults to `DD/MM/YYYY`.
+    - Number formatting follows `en-IN` Lakhs/Crores grouping (e.g., `1,25,000.00`).
+    - Academic session start month defaults to `April` (month 4, configurable per school setting).
+12. **Name, Contact & Postal Standards**:
+    - `full_name` is the mandatory name field; `last_name` is optional across all human entities (`user_profiles`, `guardians`, `students`, `employees`).
+    - Phone validation follows the Indian mobile standard: `+91` prefix with 10 digits (`^\+91[6-9]\d{9}$`). Location records mandate `pin_code` (6-digit Indian PIN) and `state`.
+13. **Payment Modes, UPI QR & Non-Custodial Split Settlement**:
+    - Supported payment modes: `cash`, `cheque`, `bank_transfer`, `upi`, `net_banking`, `card`, `demand_draft`.
+    - Every fee voucher PDF embeds a dynamic UPI QR code (`upi://pay?pa=...&pn=...&am=...&cu=INR&tn=...`) for instant 1-click scanning via BHIM, PhonePe, Google Pay, or Paytm.
+    - `PaymentGatewayAdapter` enforces a direct split-settlement model (e.g., Razorpay Route, Cashfree Split). The ERP platform **never holds or pools school funds**; all student fee remittances settle directly into the school's KYC-verified merchant bank account.
+14. **TRAI DLT SMS & Multi-Channel Alert Hierarchy**:
+    - Mobile Push Notifications (FCM / APNs) serve as the **primary** alert channel. SMS is strictly a secondary **fallback** channel.
+    - In India configuration, every outbound SMS must bind to a registered TRAI DLT template (`dlt_entity_id`, `dlt_header`, `dlt_template_id`, `variable_count`). Raw free-text SMS is strictly blocked. Local development uses `ConsoleNotificationAdapter` logging to stdout.
+15. **DPDP Act 2023 Statutory Privacy & Security**:
+    - Web and mobile applications are strictly prohibited from embedding third-party advertising SDKs or tracking analytics transmitting student identifiers.
+    - Verifiable parental consent logging (`data_consent_logs`) for processing student data under 18.
+    - Per-school data retention setting (default 7 years). Machine-readable data export and right-to-erasure workflows.
+    - Statutory `data_breach_logs` table enforcing a 72-hour Data Protection Board of India (DPBI) incident notification runbook.
+    - Digitally signed Data Processing Agreement (DPA) required during school onboarding.
+16. **Bilingual Languages & Typography**:
+    - Platform internationalization supports English (`en-IN`) primary and Hindi (`hi-IN`) secondary from day one.
+    - Typography pairs `Inter` for Latin scripts with `Noto Sans Devanagari` for Hindi script rendering across web, mobile, PDF vouchers, and report cards.
 
 ---
 
@@ -38,12 +63,18 @@ To prevent implementation ambiguity, all quantitative calculations are formalize
 ### 3.1 Late Fine Calculation
 Late fees are charged when a fee voucher remains unpaid after its specified `due_date`. Two calculation modes are supported: `fixed_amount` and `per_day`. Both support an optional `grace_period_days` and `max_fine_minor_units`. Compounding interest is strictly prohibited.
 
-#### Grace Period Invariant:
-The grace period provides a penalty-free window for on-time settlement. However, once the grace period is exceeded ($\text{Days Overdue} > \text{Grace Period Days}$), **all days elapsed since the original due date are charged retroactively** (i.e., $\text{Chargeable Days} = \text{Days Overdue}$, NOT $\text{Days Overdue} - \text{Grace Period Days}$). For example, if the due date is October 10 and the grace period is 5 days, paying on October 18 incurs a fine for all 8 overdue days ($8 \times \text{daily rate}$), not 3 days. (The alternative of charging only days elapsed after grace is documented in `docs/OPEN_QUESTIONS.md` for school administrative decision).
+#### Grace Period Calculation Policy (`grace_fine_mode`):
+Schools configure late fine behavior via `grace_fine_mode` stored on `fee_late_fine_policies` and snapshotted on each voucher together with the other fine parameters:
+- **`incremental`** (**Default**): The grace period acts as a deduction window. Fines are charged **only for days elapsed after the grace period expires** ($\max(0, \text{Days Overdue} - \text{Grace Period Days})$).
+- **`retroactive`**: The grace period acts as an on-time incentive window. Once the grace period is exceeded ($\text{Days Overdue} > \text{Grace Period Days}$), **all days elapsed since the original due date are charged retroactively** (i.e., Chargeable Days = Days Overdue).
 
 #### Formulas:
 $$\text{Days Overdue} = \max(0, \text{Payment Date} - \text{Due Date})$$
-$$\text{Chargeable Days} = \begin{cases} 0 & \text{if } \text{Days Overdue} \le \text{Grace Period Days} \\ \text{Days Overdue} & \text{if } \text{Days Overdue} > \text{Grace Period Days} \end{cases}$$
+$$\text{Chargeable Days} = \begin{cases} 
+0 & \text{if } \text{Days Overdue} \le \text{Grace Period Days} \\ 
+\text{Days Overdue} - \text{Grace Period Days} & \text{if } \text{Days Overdue} > \text{Grace Period Days} \text{ AND } \text{grace\_fine\_mode} = \text{'incremental'} \\ 
+\text{Days Overdue} & \text{if } \text{Days Overdue} > \text{Grace Period Days} \text{ AND } \text{grace\_fine\_mode} = \text{'retroactive'} 
+\end{cases}$$
 
 - **Mode 1 (`fixed_amount`)**:
   $$\text{Fine} = \begin{cases} 0 & \text{if } \text{Chargeable Days} = 0 \\ \text{Fixed Fine Amount} & \text{if } \text{Chargeable Days} > 0 \end{cases}$$
@@ -51,24 +82,40 @@ $$\text{Chargeable Days} = \begin{cases} 0 & \text{if } \text{Days Overdue} \le 
   $$\text{Raw Fine} = \text{Chargeable Days} \times \text{Daily Fine Rate}$$
   $$\text{Fine} = \begin{cases} \text{Raw Fine} & \text{if Max Fine Cap is NULL} \\ \min(\text{Raw Fine}, \text{Max Fine Cap}) & \text{if Max Fine Cap is set} \end{cases}$$
 
-#### Worked Example:
+#### Worked Examples:
 - **Parameters**:
-  - Currency: USD (minor units = cents, $1.00 = 100 cents).
+  - Currency: INR (minor units = paise, ₹1.00 = 100 paise).
   - Due Date: October 10, 2026.
   - Grace Period: 5 days (Grace cutoff = October 15, 2026 at 23:59:59 UTC).
   - Mode: `per_day`.
-  - Daily Rate: 150 cents ($1.50/day).
-  - Max Fine Cap: 1,500 cents ($15.00).
-- **Case 1 (Paid on October 14, 2026)**:
-  - Days Overdue = 4. Since $4 \le 5$, Chargeable Days = 0. Fine = **0 cents ($0.00)**.
-- **Case 2 (Paid on October 18, 2026)**:
-  - Days Overdue = 8. Since $8 > 5$, Chargeable Days = 8 (all days since due date).
-  - Raw Fine = $8 \times 150 = 1,200\text{ cents (\$12.00)}$.
-  - Cap Evaluation: $\min(1200, 1500) = \mathbf{1,200\text{ cents (\$12.00)}}$.
-- **Case 3 (Paid on November 05, 2026)**:
-  - Days Overdue = 26. Chargeable Days = 26.
-  - Raw Fine = $26 \times 150 = 3,900\text{ cents (\$39.00)}$.
-  - Cap Evaluation: $\min(3900, 1500) = \mathbf{1,500\text{ cents (\$15.00)}}$.
+  - Daily Rate: 150 paise (₹1.50/day).
+  - Max Fine Cap: 1,500 paise (₹15.00).
+
+- **Comparison: 15th versus 16th Payment Date**:
+  - **Payment on October 15, 2026 (Day 5, Within Grace Period)**:
+    - Days Overdue = 5.
+    - Since $5 \le 5$, Chargeable Days = 0 under **both** `incremental` and `retroactive` modes.
+    - Fine = **0 paise (₹0.00)**.
+  - **Payment on October 16, 2026 (Day 6, First Day Past Grace Period)**:
+    - Days Overdue = 6 ($6 > 5$, grace period exceeded).
+    - **Under `incremental` mode (Default)**:
+      - Chargeable Days = $6 - 5 = \mathbf{1\text{ day}}$ (only days beyond grace).
+      - Raw Fine = $1 \times 150 = 150\text{ paise (₹1.50)}$.
+      - Cap Evaluation: $\min(150, 1500) = \mathbf{150\text{ paise (₹1.50)}}$.
+    - **Under `retroactive` mode**:
+      - Chargeable Days = $\mathbf{6\text{ days}}$ (all days since due date).
+      - Raw Fine = $6 \times 150 = 900\text{ paise (₹9.00)}$.
+      - Cap Evaluation: $\min(900, 1500) = \mathbf{900\text{ paise (₹9.00)}}$.
+
+- **Case 2 (Payment on October 18, 2026 - 8 Days Overdue)**:
+  - Days Overdue = 8 ($8 > 5$).
+  - **Under `incremental`**: Chargeable Days = $8 - 5 = 3\text{ days}$. Fine = $\min(3 \times 150, 1500) = \mathbf{450\text{ paise (₹4.50)}}$.
+  - **Under `retroactive`**: Chargeable Days = $8\text{ days}$. Fine = $\min(8 \times 150, 1500) = \mathbf{1,200\text{ paise (₹12.00)}}$.
+
+- **Case 3 (Payment on November 05, 2026 - 26 Days Overdue, Cap Reached)**:
+  - Days Overdue = 26 ($26 > 5$).
+  - **Under `incremental`**: Chargeable Days = $26 - 5 = 21\text{ days}$. Raw Fine = $21 \times 150 = 3,150\text{ paise}$. Cap Evaluation: $\min(3150, 1500) = \mathbf{1,500\text{ paise (₹15.00)}}$.
+  - **Under `retroactive`**: Chargeable Days = $26\text{ days}$. Raw Fine = $26 \times 150 = 3,900\text{ paise}$. Cap Evaluation: $\min(3900, 1500) = \mathbf{1,500\text{ paise (₹15.00)}}$.
 
 ---
 
@@ -90,22 +137,22 @@ Discounts reduce fee liabilities and can be configured as a fixed minor unit amo
   - Child 2 (Born 2016-09-15, Grade 4): Second child $\to$ Tier 2 (20% tuition discount).
   - Child 3 (Born 2019-02-01, Grade 1): Third child $\to$ Tier 3 (50% tuition discount).
 - **Fee Particulars for the Month**:
-  - Grade 6: Tuition = 12,000 cents ($120.00), Science Lab = 1,500 cents ($15.00).
-  - Grade 4: Tuition = 10,000 cents ($100.00), Computer Lab = 1,000 cents ($10.00).
-  - Grade 1: Tuition = 8,000 cents ($80.00), Art Supplies = 800 cents ($8.00).
+  - Grade 6: Tuition = 12,000 paise (₹120.00), Science Lab = 1,500 paise (₹15.00).
+  - Grade 4: Tuition = 10,000 paise (₹100.00), Computer Lab = 1,000 paise (₹10.00).
+  - Grade 1: Tuition = 8,000 paise (₹80.00), Art Supplies = 800 paise (₹8.00).
 - **Calculations**:
-  - Child 1: Tuition = 12,000 cents, Lab = 1,500 cents. Total = **13,500 cents ($135.00)**.
+  - Child 1: Tuition = 12,000 paise, Lab = 1,500 paise. Total = **13,500 paise (₹135.00)**.
   - Child 2:
-    - Tuition Discount = $\text{round}(10000 \times 0.20) = 2,000\text{ cents}$.
-    - Net Tuition = $10000 - 2000 = 8,000\text{ cents}$.
-    - Computer Lab = 1,000 cents (no discount).
-    - Total = $8000 + 1000 = \mathbf{9,000\text{ cents (\$90.00)}}$.
+    - Tuition Discount = $\text{round}(10000 \times 0.20) = 2,000\text{ paise}$.
+    - Net Tuition = $10000 - 2000 = 8,000\text{ paise}$.
+    - Computer Lab = 1,000 paise (no discount).
+    - Total = $8000 + 1000 = \mathbf{9,000\text{ paise (₹90.00)}}$.
   - Child 3:
-    - Tuition Discount = $\text{round}(8000 \times 0.50) = 4,000\text{ cents}$.
-    - Net Tuition = $8000 - 4000 = 4,000\text{ cents}$.
-    - Art Supplies = 800 cents (no discount).
-    - Total = $4000 + 800 = \mathbf{4,800\text{ cents (\$48.00)}}$.
-- **Consolidated Family Payable**: $13500 + 9000 + 4800 = \mathbf{27,300\text{ cents (\$273.00)}}$.
+    - Tuition Discount = $\text{round}(8000 \times 0.50) = 4,000\text{ paise}$.
+    - Net Tuition = $8000 - 4000 = 4,000\text{ paise}$.
+    - Art Supplies = 800 paise (no discount).
+    - Total = $4000 + 800 = \mathbf{4,800\text{ paise (₹48.00)}}$.
+- **Consolidated Family Payable**: $13500 + 9000 + 4800 = \mathbf{27,300\text{ paise (₹273.00)}}$.
 
 ---
 
@@ -133,42 +180,42 @@ Financial records maintain absolute referential integrity across academic years.
 
 #### Worked Example 1 (Unpaid Arrears Carried Forward):
 - **Session 2025-2026 Enrollment (E-101)**:
-  - May 2026 Tuition Charge: $+10,000\text{ cents}$.
-  - May 2026 Late Fine Charge: $+1,000\text{ cents}$.
-  - Partial Payment Received: $-6,000\text{ cents}$.
-  - June 2026 Tuition Charge: $+10,000\text{ cents}$.
-  - Closing Balance at Session End = $10000 + 1000 - 6000 + 10000 = \mathbf{+15,000\text{ cents (\$150.00)}}$.
+  - May 2026 Tuition Charge: $+10,000\text{ paise (₹100.00)}$.
+  - May 2026 Late Fine Charge: $+1,000\text{ paise (₹10.00)}$.
+  - Partial Payment Received: $-6,000\text{ paise (-₹60.00)}$.
+  - June 2026 Tuition Charge: $+10,000\text{ paise (₹100.00)}$.
+  - Closing Balance at Session End = $10000 + 1000 - 6000 + 10000 = \mathbf{+15,000\text{ paise (₹150.00)}}$.
 - **Rollover to Session 2026-2027 Enrollment (E-202)**:
   - System inserts single row into `fee_ledger_entries`:
     - `id`: `gen_random_uuid()`
     - `enrollment_id`: `E-202`
     - `entry_type`: `'opening_balance'`
     - `amount`: `+15000`
-    - `currency`: `'USD'`
+    - `currency`: `'INR'`
   - First voucher of new session displays:
-    - Opening Arrears: \$150.00
-    - July 2026 Tuition: \$110.00 (11,000 cents)
-    - Total Due: **\$260.00 (26,000 cents)**.
+    - Opening Arrears: ₹150.00 (15,000 paise)
+    - July 2026 Tuition: ₹110.00 (11,000 paise)
+    - Total Due: **₹260.00 (26,000 paise)**.
 
 #### Worked Example 2 (Overpaid Advance Credit Carried Forward):
 - **Session 2025-2026 Enrollment (E-105)**:
-  - May 2026 Tuition Charge: $+10,000\text{ cents}$.
-  - June 2026 Tuition Charge: $+10,000\text{ cents}$.
-  - Advance Lump Sum Payment Received: $-25,000\text{ cents}$.
-  - Closing Balance at Session End = $10000 + 10000 - 25000 = \mathbf{-5,000\text{ cents (-\$50.00)}}$ (Overpaid credit).
+  - May 2026 Tuition Charge: $+10,000\text{ paise (₹100.00)}$.
+  - June 2026 Tuition Charge: $+10,000\text{ paise (₹100.00)}$.
+  - Advance Lump Sum Payment Received: $-25,000\text{ paise (-₹250.00)}$.
+  - Closing Balance at Session End = $10000 + 10000 - 25000 = \mathbf{-5,000\text{ paise (-₹50.00)}}$ (Overpaid credit).
 - **Rollover to Session 2026-2027 Enrollment (E-205)**:
   - System inserts single row into `fee_ledger_entries`:
     - `id`: `gen_random_uuid()`
     - `enrollment_id`: `E-205`
     - `entry_type`: `'opening_balance'`
     - `amount`: `-5000` (signed negative integer)
-    - `currency`: `'USD'`
+    - `currency`: `'INR'`
     - `description`: `'Advance credit carried forward from Academic Session 2025-2026'`
-  - First voucher of new session (July 2026, Tuition = $+12,000\text{ cents}$):
-    - Opening Credit: -\$50.00 (-5,000 cents)
-    - July 2026 Tuition: +\$120.00 (+12,000 cents)
-    - Net Amount Payable: **\$70.00 (7,000 cents)**.
-    - Running Ledger Balance: $-5000 + 12000 = \mathbf{+7,000\text{ cents}}$.
+  - First voucher of new session (July 2026, Tuition = $+12,000\text{ paise / ₹120.00}$):
+    - Opening Credit: -₹50.00 (-5,000 paise)
+    - July 2026 Tuition: +₹120.00 (+12,000 paise)
+    - Net Amount Payable: **₹70.00 (7,000 paise)**.
+    - Running Ledger Balance: $-5000 + 12000 = \mathbf{+7,000\text{ paise (₹70.00)}}$.
 
 ---
 
@@ -184,42 +231,60 @@ When a student or parent makes a partial payment against a voucher or outstandin
 
 #### Worked Example:
 - **Current Voucher Dues Breakdown**:
-  - Arrears from Prior Month: 8,000 cents (\$80.00)
-  - Late Fine Accrued: 1,500 cents (\$15.00)
-  - Current Month Tuition Fee: 12,000 cents (\$120.00)
-  - Computer Lab Fee: 2,000 cents (\$20.00)
-  - Bus Transport Fee: 4,000 cents (\$40.00)
-  - **Total Voucher Amount Due**: **27,500 cents (\$275.00)**.
-- **Payment Event**: Parent pays **15,000 cents (\$150.00)** in cash.
+  - Arrears from Prior Month: 8,000 paise (₹80.00)
+  - Late Fine Accrued: 1,500 paise (₹15.00)
+  - Current Month Tuition Fee: 12,000 paise (₹120.00)
+  - Computer Lab Fee: 2,000 paise (₹20.00)
+  - Bus Transport Fee: 4,000 paise (₹40.00)
+  - **Total Voucher Amount Due**: **27,500 paise (₹275.00)**.
+- **Payment Event**: Parent pays **15,000 paise (₹150.00)** in cash.
 - **Waterfall Step-by-Step Execution**:
-  1. *Arrears*: 8,000 cents required. Available = 15,000 cents.
-     - Allocated: **8,000 cents**. Remaining Payment = $15000 - 8000 = 7,000\text{ cents}$. Arrears Balance = **0 cents**.
-  2. *Late Fine*: 1,500 cents required. Available = 7,000 cents.
-     - Allocated: **1,500 cents**. Remaining Payment = $7000 - 1500 = 5,500\text{ cents}$. Late Fine Balance = **0 cents**.
-  3. *Tuition Fee*: 12,000 cents required. Available = 5,500 cents.
-     - Allocated: **5,500 cents**. Remaining Payment = $5500 - 5500 = 0\text{ cents}$. Tuition Balance = $12000 - 5500 = \mathbf{6,500\text{ cents (\$65.00)}}$.
-  4. *Computer Lab Fee*: 2,000 cents required. Available = 0 cents.
-     - Allocated: **0 cents**. Lab Balance = **2,000 cents (\$20.00)**.
-  5. *Bus Transport Fee*: 4,000 cents required. Available = 0 cents.
-     - Allocated: **0 cents**. Transport Balance = **4,000 cents (\$40.00)**.
+  1. *Arrears*: 8,000 paise required. Available = 15,000 paise.
+     - Allocated: **8,000 paise**. Remaining Payment = $15000 - 8000 = 7,000\text{ paise}$. Arrears Balance = **0 paise**.
+  2. *Late Fine*: 1,500 paise required. Available = 7,000 paise.
+     - Allocated: **1,500 paise**. Remaining Payment = $7000 - 1500 = 5,500\text{ paise}$. Late Fine Balance = **0 paise**.
+  3. *Tuition Fee*: 12,000 paise required. Available = 5,500 paise.
+     - Allocated: **5,500 paise**. Remaining Payment = $5500 - 5500 = 0\text{ paise}$. Tuition Balance = $12000 - 5500 = \mathbf{6,500\text{ paise (₹65.00)}}$.
+  4. *Computer Lab Fee*: 2,000 paise required. Available = 0 paise.
+     - Allocated: **0 paise**. Lab Balance = **2,000 paise (₹20.00)**.
+  5. *Bus Transport Fee*: 4,000 paise required. Available = 0 paise.
+     - Allocated: **0 paise**. Transport Balance = **4,000 paise (₹40.00)**.
 - **Post-Payment Summary**:
-  - Paid Amount: 15,000 cents (\$150.00).
-  - Remaining Unpaid Voucher Balance: $6500 + 2000 + 4000 = \mathbf{12,500\text{ cents (\$125.00)}}$.
+  - Paid Amount: 15,000 paise (₹150.00).
+  - Remaining Unpaid Voucher Balance: $6500 + 2000 + 4000 = \mathbf{12,500\text{ paise (₹125.00)}}$.
 
 ---
 
 ### 3.5 Grading Scales and GPA Formulation
 Academic performance is tracked as marks of type `numeric(6,2)` along with an evaluation status (`present`, `absent`, `exempt`, `unfair_means`). Aggregate percentages and Grade Point Averages (GPA) use credit-weighted formulas.
 
-#### Grading Table Specification:
-| Percentage Range | Letter Grade | Grade Point | Status | Description |
-| :--- | :---: | :---: | :---: | :--- |
-| $90.00\% - 100.00\%$ | A+ | 4.00 | PASS | Outstanding |
-| $80.00\% - 89.99\%$ | A | 3.75 | PASS | Excellent |
-| $70.00\% - 79.99\%$ | B | 3.00 | PASS | Very Good |
-| $60.00\% - 69.99\%$ | C | 2.00 | PASS | Good |
-| $50.00\% - 59.99\%$ | D | 1.00 | PASS | Satisfactory / Pass |
-| $0.00\% - 49.99\%$ | F | 0.00 | FAIL | Unsatisfactory |
+#### Grading Scale Presets:
+Schools select or customize a grading scale preset via `school_settings.grading_preset`:
+1. **`cbse_style` Preset** (**Default for India**): 9-band or 8-band grading framework aligned with CBSE/State continuous evaluation. Exact grading bands: *to be copied from the pilot school's report card* (all tiers and descriptors editable).
+2. **`standard_4_0` Preset**: Standard 6-tier letter scale with credit-weighted Grade Point Average (GPA):
+   | Percentage Range | Letter Grade | Grade Point | Status | Description |
+   | :--- | :---: | :---: | :---: | :--- |
+   | $90.00\% - 100.00\%$ | A+ | 4.00 | PASS | Outstanding |
+   | $80.00\% - 89.99\%$ | A | 3.75 | PASS | Excellent |
+   | $70.00\% - 79.99\%$ | B | 3.00 | PASS | Very Good |
+   | $60.00\% - 69.99\%$ | C | 2.00 | PASS | Good |
+   | $50.00\% - 59.99\%$ | D | 1.00 | PASS | Satisfactory / Pass |
+   | $0.00\% - 49.99\%$ | F | 0.00 | FAIL | Unsatisfactory |
+3. **`percentage_only` Preset**: Displays raw subject marks, maximum marks, and computed percentage with zero letter grades or GPA conversions.
+
+#### Pass Mark Configuration & Inheritance Hierarchy:
+During the school setup wizard, the system explicitly prompts the school administrator to confirm the default passing mark:
+- **Board Presets**:
+  - **`CBSE` Preset**: Suggests default pass mark of `33.00%` (editable).
+  - **`State` Preset**: Suggests default pass mark of `33.00%` (editable).
+  - **`ICSE` Preset**: Leaves pass mark blank until confirmed by the school administrator during setup.
+  - **`Custom` Preset**: Leaves pass mark blank until confirmed by the school administrator during setup.
+- **Inheritance Hierarchy**:
+  The passing mark threshold is resolved dynamically via a 3-tier fallback hierarchy:
+  1. `subjects.passing_percentage`: If defined on the subject, it overrides higher levels.
+  2. If NULL, `classes.default_passing_percentage`: Inherited from the class.
+  3. If NULL, `schools.default_passing_percentage`: Inherited from the school-wide setting configured in the setup wizard.
+  For scheduled exams, `exam_schedules.passing_marks` takes absolute priority when defined; when NULL, it evaluates the resolved percentage against `exam_schedules.max_marks`.
 
 #### Formula:
 $$\text{Subject Percentage} = \text{round}\left(\frac{\text{Marks Obtained}}{\text{Maximum Marks}} \times 100, 2\right)$$
@@ -363,19 +428,19 @@ $$\text{round\_half\_away\_from\_zero}(x) = \operatorname{sgn}(x) \times \lfloor
 
 #### Worked Example:
 A student invoice has three percentage-calculated fee heads:
-1. **Tuition**: Base = 12,555 cents ($125.55). Discount = 15%.
-   - Discount Float = $12555 \times 0.15 = 1883.25\text{ cents}$.
-   - Rounded Discount = $\text{round}(1883.25) = 1,883\text{ cents (\$18.83)}$.
-   - Net Tuition = $12555 - 1883 = \mathbf{10,672\text{ cents (\$106.72)}}$.
-2. **Laboratory Consumables**: Base = 3,333 cents ($33.33). Subsidy = 7.5%.
-   - Subsidy Float = $3333 \times 0.075 = 249.975\text{ cents}$.
-   - Rounded Subsidy = $\text{round}(249.975) = 250\text{ cents (\$2.50)}$.
-   - Net Lab = $3333 - 250 = \mathbf{3,083\text{ cents (\$30.83)}}$.
-3. **Tax on fee head** (Generic tax head, disabled by default in school settings; when enabled, configured as 3.5% on gross tuition): Base = 12,555 cents ($125.55).
-   - Tax Float = $12555 \times 0.035 = 439.425\text{ cents}$.
-   - Rounded Tax = $\text{round}(439.425) = \mathbf{439\text{ cents (\$4.39)}}$.
+1. **Tuition**: Base = 12,555 paise (₹125.55). Discount = 15%.
+   - Discount Float = $12555 \times 0.15 = 1883.25\text{ paise}$.
+   - Rounded Discount = $\text{round}(1883.25) = 1,883\text{ paise (₹18.83)}$.
+   - Net Tuition = $12555 - 1883 = \mathbf{10,672\text{ paise (₹106.72)}}$.
+2. **Laboratory Consumables**: Base = 3,333 paise (₹33.33). Subsidy = 7.5%.
+   - Subsidy Float = $3333 \times 0.075 = 249.975\text{ paise}$.
+   - Rounded Subsidy = $\text{round}(249.975) = 250\text{ paise (₹2.50)}$.
+   - Net Lab = $3333 - 250 = \mathbf{3,083\text{ paise (₹30.83)}}$.
+3. **Tax on fee head** (Generic tax head, disabled by default in school settings; when enabled, configured as 3.5% on gross tuition): Base = 12,555 paise (₹125.55).
+   - Tax Float = $12555 \times 0.035 = 439.425\text{ paise}$.
+   - Rounded Tax = $\text{round}(439.425) = \mathbf{439\text{ paise (₹4.39)}}$.
 - **Sum of Line Items**:
-  $$\text{Total Invoice Payable} = 10672 + 3083 + 439 = \mathbf{14,194\text{ cents (\$141.94)}}$$
+  $$\text{Total Invoice Payable} = 10672 + 3083 + 439 = \mathbf{14,194\text{ paise (₹141.94)}}$$
 *(Direct unrounded sum would produce $12555 - 1883.25 + 3333 - 249.975 + 439.425 = 14194.20 \to 14194$, validating exact mathematical consistency).*
 
 ---
@@ -388,29 +453,29 @@ When a payer tenders an amount in excess of an active voucher's net payable, the
 - `advance_applied` exists **strictly as an allocation record in `fee_payment_allocations`** (linking the prior excess payment to the new voucher's head charges) and as a **deduction line item on the printed voucher / UI display** to explain why the net payable is reduced.
 
 #### Step-by-Step Worked Example:
-- **Starting State**: Enrollment E-101 has an initial ledger balance of 0 cents.
+- **Starting State**: Enrollment E-101 has an initial ledger balance of 0 paise.
 - **Month 1 (September 2026)**:
-  - Voucher V-001 generated for 10,000 cents ($100.00).
-  - Payer tenders 14,000 cents ($140.00) in cash/bank against Voucher V-001.
+  - Voucher V-001 generated for 10,000 paise (₹100.00).
+  - Payer tenders 14,000 paise (₹140.00) in cash/bank against Voucher V-001.
 - **Month 2 (October 2026)**:
-  - Voucher V-002 generated for 10,000 cents ($100.00).
+  - Voucher V-002 generated for 10,000 paise (₹100.00).
 
 #### Complete Ledger Rows & Allocation Log:
 
 | Row # | Target Entity | `id` | `entry_type` | Amount (signed minor units) | Linked Voucher | Running Ledger Balance ($\sum \text{amount}$) | Accounting Event Description |
 | :---: | :--- | :--- | :--- | :---: | :--- | :---: | :--- |
-| **1** | `fee_ledger_entries` | `row-001` | `'charge'` | `+10,000` | `V-001` | `+10,000` | Month 1 Tuition Charge. Student owes 10,000 cents. |
-| **2** | `fee_ledger_entries` | `row-002` | `'payment'` | `-14,000` | `V-001` | `-4,000` | Payer tenders 14,000 cents. Running balance is now -4,000 (4,000 advance credit). |
-| *alloc* | `fee_payment_allocations` | `alloc-01` | - | `10,000` | `V-001` | - | 10,000 allocated to V-001 tuition. V-001 status $\to$ `'paid'`. |
-| *alloc* | `fee_payment_allocations` | `alloc-02` | - | `4,000` | `NULL` | - | 4,000 unallocated advance credit tracked in allocations. |
-| **3** | `fee_ledger_entries` | `row-003` | `'charge'` | `+10,000` | `V-002` | `+6,000` | Month 2 Tuition Charge. Balance: $-4,000 + 10,000 = \mathbf{+6,000}$. |
-| *alloc* | `fee_payment_allocations` | `alloc-03` | - | `4,000` | `V-002` | - | System allocates 4,000 advance credit to V-002 charges. |
-| *view* | **Voucher V-002 Display** | - | - | - | `V-002` | - | **Display / Print Line**: Billed = \$100.00, Less Advance Applied = -\$40.00, **Net Payable = \$60.00 (6,000 cents)**. |
+| **1** | `fee_ledger_entries` | `row-001` | `'charge'` | `+10,000` | `V-001` | `+10,000` | Month 1 Tuition Charge. Student owes 10,000 paise (₹100.00). |
+| **2** | `fee_ledger_entries` | `row-002` | `'payment'` | `-14,000` | `V-001` | `-4,000` | Payer tenders 14,000 paise (₹140.00). Running balance is now -4,000 paise (₹40.00 advance credit). |
+| *alloc* | `fee_payment_allocations` | `alloc-01` | - | `10,000` | `V-001` | - | 10,000 paise allocated to V-001 tuition. V-001 status $\to$ `'paid'`. |
+| *alloc* | `fee_payment_allocations` | `alloc-02` | - | `4,000` | `NULL` | - | 4,000 paise unallocated advance credit tracked in allocations. |
+| **3** | `fee_ledger_entries` | `row-003` | `'charge'` | `+10,000` | `V-002` | `+6,000` | Month 2 Tuition Charge. Balance: $-4,000 + 10,000 = \mathbf{+6,000\text{ paise}}$. |
+| *alloc* | `fee_payment_allocations` | `alloc-03` | - | `4,000` | `V-002` | - | System allocates 4,000 paise advance credit to V-002 charges. |
+| *view* | **Voucher V-002 Display** | - | - | - | `V-002` | - | **Display / Print Line**: Billed = ₹100.00, Less Advance Applied = -₹40.00, **Net Payable = ₹60.00 (6,000 paise)**. |
 
-- **Final Amount Due**: The net amount due by the student across all ledgers is strictly $\sum \text{amount} = \mathbf{+6,000\text{ cents (\$60.00)}}$.
-- **Settlement of Month 2**: When the parent pays the remaining $60.00:
+- **Final Amount Due**: The net amount due by the student across all ledgers is strictly $\sum \text{amount} = \mathbf{+6,000\text{ paise (₹60.00)}}$.
+- **Settlement of Month 2**: When the parent pays the remaining ₹60.00 (6,000 paise):
   - Row 4 written to `fee_ledger_entries`: `entry_type = 'payment'`, `amount = -6,000`, `fee_voucher_id = V-002`.
-  - Final Running Balance: $+6000 + (-6000) = \mathbf{0\text{ cents}}$. Exactly zero credit is counted twice.
+  - Final Running Balance: $+6000 + (-6000) = \mathbf{0\text{ paise}}$. Exactly zero credit is counted twice.
 
 ---
 
@@ -432,10 +497,13 @@ The structural foundation of a school tenant. Defines academic sessions (calenda
 #### 1.3 Concrete Business Rules
 1. Only one academic session per school can be marked with `status = 'active'`. Past sessions are marked `'completed'`; future sessions are marked `'upcoming'`.
 2. A school must have at least one campus (default: "Main Campus"). Campuses share the same `school_id`.
-3. Classes possess a mandatory integer `grade_level` (e.g., -2 for Nursery, -1 for KG, 1 through 12) to govern academic progression and sorting.
+3. Classes possess a mandatory integer `numeric_level` (-3 for Nursery, -2 for LKG, -1 for UKG, 1 through 10, and 11–12 with designated streams: Science, Commerce, Arts/Humanities).
 4. Section names must be unique within a class and campus (e.g., Class 5 - Section A).
 5. A section can have at most one designated Class Teacher per academic session.
 6. Class-subject-teacher mappings are unique per `(academic_session_id, section_id, subject_id)`.
+7. Passing mark threshold defaults to 33.00% under CBSE and State board presets, configurable hierarchically at the school level (`schools.default_passing_percentage`), class level (`classes.default_passing_percentage`), and subject level (`subjects.passing_percentage`).
+8. **Board Presets Seeding (`CBSE`, `ICSE`, `State`, `Custom`)**: Pre-seeds the class roster (Nursery to 12 with streams for 11–12), pass marks (33% for CBSE/State), and sets grading scale bands marked *to be copied from the pilot school's report card*.
+9. **Academic Year Start Month**: Configurable per school via `schools.academic_year_start_month`, defaulting to April (month 4) for Indian academic sessions.
 
 #### 1.4 Edge Cases & Failure Modes
 - Attempting to delete a class that contains active student enrollments: Database foreign key constraint rejects deletion. User receives friendly error: "Cannot delete class with active student enrollments."
@@ -463,7 +531,7 @@ Manages student biographical data, admission processing, family/sibling linking,
 
 #### 2.3 Concrete Business Rules
 1. Every student is assigned an `admission_number` that is strictly unique within the `school_id`.
-2. A student cannot exist without at least one primary `guardian` (Father, Mother, or Legal Guardian) containing a valid name and mobile phone number linked via `student_guardians`.
+2. A student must have a mandatory `full_name` (`last_name` optional) and at least one primary `guardian` containing a mandatory `full_name`, Indian mobile phone (`+91` with 10 digits: `^\+91[6-9]\d{9}$`), `state`, and `pin_code` linked via `student_guardians`.
 3. Every student admission automatically creates a record in `student_enrollments` for the active academic session, assigning a `roll_number` that is unique per `(academic_session_id, section_id)`.
 4. Student lifecycle states are strictly controlled:
    - `enrolled`: Actively studying and billed.
@@ -474,6 +542,13 @@ Manages student biographical data, admission processing, family/sibling linking,
    - `withdrawn`: Formal parental withdrawal with all dues cleared.
    - `struck_off`: Administratively removed due to prolonged non-attendance or non-payment.
 5. Soft-delete is enforced (`deleted_at`). Deleting a student never removes financial ledger records or historical marks.
+6. **Social Categories**: Students are categorized under statutory categories: `General`, `OBC`, `SC`, `ST`, and `EWS` (Economically Weaker Section).
+7. **National Educational Identifiers (Optional)**:
+   - `sr_number`: Scholar Register / Admission Register Number.
+   - `pen`: Permanent Education Number (UDISE+).
+   - `apaar_id`: Automated Permanent Academic Account Registry / One Nation One Student ID (12 digits).
+   - `aadhaar`: Not collected by default. If enabled per school (`schools.collect_aadhaar = true`), it is encrypted at rest with pgcrypto / KMS and strictly displayed masked in all UI screens and API responses as `XXXXXXXX1234`.
+8. **Right to Education (RTE) Concessions**: Students admitted under the 25% RTE statutory quota receive the `'rte_waiver'` discount type, granting a 100% concession on tuition and designated fee heads.
 
 #### 2.4 Edge Cases & Failure Modes
 - Duplicate admission number in Excel bulk import: Entire import row is flagged with validation error; transactional bulk import provides a row-by-row error report without corrupting clean rows.
@@ -505,6 +580,7 @@ Maintains complete employee profiles, administrative departments, job designatio
 3. Creating a staff member with role `teacher` or `accountant` triggers the creation of a Supabase auth user with corresponding JWT claims.
 4. Leave types include Casual, Sick, Annual, Maternity, and Unpaid. Each leave type has an annual quota configured per school.
 5. Leave applications cannot overlap with existing approved leaves for the same employee.
+6. **Name, Contact & Banking Standards**: Staff profiles mandate `full_name` (`last_name` optional), Indian 10-digit mobile phone (`+91`), residential `state` and `pin_code`, and salary disbursement bank account with Indian Financial System Code (`bank_ifsc`).
 
 #### 3.4 Edge Cases & Failure Modes
 - Staff member resigns while assigned as Class Teacher: System requires reassigning the Class Teacher role to an active staff member before archiving the resigning employee.
@@ -534,8 +610,13 @@ Comprehensive daily class attendance, period-by-period subject attendance, staff
 1. Attendance status values: `present`, `absent`, `late`, `half_day`, `leave`.
 2. Student daily attendance is unique per `(school_id, enrollment_id, attendance_date)`.
 3. Attendance percentage formula:
-   $$\text{Attendance } \% = \text{round}\left(\frac{\text{Present Days} + (0.5 \times \text{Half Days})}{\text{Total School Working Days}} \times 100, 2\right)$$
-4. Marking a student absent automatically queues an SMS dispatch job in `job_queue` (if school alert setting is enabled).
+   $$\text{Attendance } \% = \text{round}\left(\frac{\text{Present Days} + (0.5 \times \text{Half Days})}{\text{Total Real Working Days}} \times 100, 2\right)$$
+   Total Real Working Days is dynamically evaluated per student cohort based on `school_settings.week_pattern` (default Monday to Saturday, 6 working days) minus declared institutional holidays in the school calendar. Standard annual promotion requires meeting the school attendance threshold of `75.00%` (`school_settings.promotion_attendance_threshold`).
+4. **Absence Alert Rules & Timing**:
+   - Absence alerts are dispatched per class section exactly 10 minutes (`school_settings.absence_alert_offset_minutes`) after the teacher submits attendance for that class section.
+   - If a class section has no attendance submission recorded by the school's cutoff time (default `09:30` local school time, `school_settings.absence_alert_cutoff_time`), the system dispatches an urgent reminder notification to the class teacher and school admin, and **never alerts parents**.
+   - No absence alerts are dispatched on designated school holidays.
+   - Multi-channel hierarchy: Mobile Push Notification is the primary alert channel; SMS is the secondary fallback sent strictly through a registered TRAI DLT template.
 5. Biometric integration maps external device user IDs to `employees.biometric_id` via a background synchronization Edge Function.
 
 #### 4.4 Edge Cases & Failure Modes
@@ -544,7 +625,7 @@ Comprehensive daily class attendance, period-by-period subject attendance, staff
 
 #### 4.5 Acceptance Criteria Checklist
 - [ ] Quick attendance grid displays all students in a section with default "All Present" toggle.
-- [ ] Automated SMS alert dispatches within 5 minutes of attendance finalization.
+- [ ] Automated parental absence alert (push notification primary, DLT-registered SMS fallback) dispatches 10 minutes after teacher attendance submission. If unsubmitted by cutoff time (default 09:30), reminders are sent to the teacher and admin, and zero alerts are sent to parents. No alerts are dispatched on designated school holidays.
 - [ ] Period-wise attendance grid tracks attendance per timetable period.
 - [ ] Monthly class attendance register generates printable PDF matrix with daily codes (P, A, L).
 - [ ] Biometric CSV upload maps punches to check-in/check-out and flags late arrivals.
@@ -604,6 +685,7 @@ Comprehensive evaluation framework managing examination terms, date sheets, roll
    - **`unfair_means`**: `marks_obtained` is stored as 0.00, maximum marks included in denominator, flagged on DMC as `'UFM'`.
 5. Class ranking uses the school's configured `rank_mode` (`shared` by default or `tie_break`) formulated in Section 3.6.
 6. Composite Term Weightages: Final DMC aggregates multiple terms according to configured percentages (e.g., Term 1: 30%, Term 2: 30%, Final: 40%).
+7. **Passing Criteria**: A subject is evaluated as passed if obtained marks equal or exceed `exam_schedules.passing_marks`. This defaults to 33.00% of maximum marks under CBSE and State board presets (and 50.00% platform baseline), configurable hierarchically per school, per class, and per subject. Exact grading bands for board presets are explicitly marked *to be copied from the pilot school's report card*. A student with marks below the configured threshold fails the subject.
 
 #### Worked Example (Exempt vs Absent Scoring):
 - Student takes 5 enrolled subjects, each with Maximum Marks = 100.00:
@@ -647,33 +729,40 @@ Enterprise school billing engine. Features fee heads, class fee structures, bulk
 1. **Append-Only Signed Ledger**: Fee transactions are strictly append-only via `fee_ledger_entries`. Mutable balance fields on student or voucher tables are strictly prohibited. `fee_ledger_entries.amount` is a signed `bigint` (positive raises what student owes; negative lowers it). Balances are computed in real time via signed aggregation:
    $$\text{Current Balance} = \sum \text{amount}$$
    (Positive balance indicates debt owed by student; negative balance indicates advance overpayment credit).
-2. **Precision and Currency**: Monetary values are `bigint` minor units (e.g., cents, paise) paired with an ISO-4217 three-letter currency code populated from `schools.default_currency`. Floating-point arithmetic is forbidden.
+2. **Precision, Currency & Locking**: Monetary values are `bigint` minor units (paise for INR, ₹1.00 = 100 paise). The currency is pre-selected as `INR` during school registration. Once the school generates its first fee voucher, currency selection is permanently locked. Floating-point arithmetic is forbidden.
 3. **Enrollment-Centric**: `fee_ledger_entries` references `enrollment_id`.
 4. **Gapless Document Sequences**: Voucher and receipt numbers are generated sequentially from `document_sequences` with row locking (`SELECT FOR UPDATE`), guaranteeing zero gaps in accounting sequences.
 5. **Sibling Discounts**: Sibling discounts apply to younger siblings linked via `student_guardians` on tuition heads as formulated in Section 3.2.
-6. **Late Fines**: Late fines follow Section 3.1 (`fixed_amount` or `per_day` with cap and grace period; strictly zero compounding). Once the grace period is exceeded, all days since the due date are charged.
+6. **Late Fines**: Late fines follow Section 3.1 (`fixed_amount` or `per_day` with cap, grace period, and snapshotted `grace_fine_mode` defaulting to `'incremental'`; strictly zero compounding).
 7. **Payment Allocation**: Partial payments are allocated via the FIFO waterfall priority in Section 3.4 and tracked in `fee_payment_allocations`.
 8. **Session Rollover**: When an academic session closes, net closing balances (arrears or advance credits) are carried into the student's new enrollment record as a single `opening_balance` ledger entry per Section 3.3, leaving prior session ledger entries completely untouched.
-9. **Payment Gateway Adapter**: Online payments verify webhook signatures via `PaymentGatewayAdapter` with mandatory idempotency keys.
+9. **Payment Gateway Adapter & Split Settlement**: Online payments verify webhook signatures via `PaymentGatewayAdapter` with mandatory idempotency keys. The adapter enforces direct split settlement to each school's KYC-verified bank account (e.g., Razorpay Route, Cashfree Split); the SaaS platform never takes custody of school funds.
 10. **Voucher Cancellation**: Generated vouchers cannot be directly updated or modified in-place. If an uncollected voucher contains errors, it must be cancelled with a mandatory audit reason. Cancellation appends compensating entries (`entry_type = 'reversal'`) for all charges associated with the voucher, marking the voucher status as `'cancelled'`. If a voucher already has recorded payments, cancellation is strictly blocked until those payments are reversed or refunded.
 11. **Refunds**: A refund is an outgoing transaction recorded as a distinct ledger entry (`entry_type = 'refund'`), specifying positive minor units, linked `reverses_entry_id` referencing the original payment entry, and a mandatory textual reason. Processing a refund requires the explicit `fees:refund` permission. Reversing a refund (`entry_type = 'reversal'` pointing to a refund entry) adds the refunded amount back to `total_paid_minor_units` (e.g., on a 5,500 voucher with a 3,000 payment and 1,000 refund giving paid 2,000 and outstanding 3,500, reversing that 1,000 refund restores paid to 3,000 and reduces outstanding to 2,500).
 12. **Advance Payments**: Any payment received in excess of the outstanding balance on a voucher or enrollment leaves a negative running ledger balance. When the subsequent month's voucher is generated, the credit is allocated via `fee_payment_allocations` and displayed as an advance credit deduction on the voucher slip per Section 3.9, without inserting duplicate negative ledger rows.
 13. **Immutability & No Editing of Generated Vouchers**: Once a fee voucher is generated and assigned a sequence number, its head items and billed amounts are immutable. Editing an existing voucher in-place is strictly prohibited. To correct a mistake, the user must either (a) cancel the entire voucher (provided zero payments exist) and regenerate a new voucher with a new sequence number, or (b) post an explicit financial adjustment entry (`entry_type = 'adjustment'`) to the fee ledger with mandatory reason and authorization.
 14. **Defaulter Definition**: A student/enrollment is classified as a fee defaulter if they have any active fee voucher whose `due_date` has passed and whose dynamically derived outstanding balance ($\sum \text{amount}$) is strictly greater than zero minor units.
+15. **Billing Frequencies**: Supported billing schedules include `one_time`, `monthly`, `quarterly` (Q1 April, Q2 July, Q3 October, Q4 January), `half_yearly`, and `annual`.
+16. **Payment Modes & Dynamic UPI QR**: Collections support `cash`, `cheque`, `bank_transfer`, `upi`, `net_banking`, `card`, and `demand_draft`. Every generated voucher PDF renders a dynamic UPI payment QR code (`upi://pay?pa=...&pn=...&am=...&cu=INR&tn=...`) for instant mobile app settlement.
+17. **RTE Waiver Discount**: Students admitted under the Right to Education statutory quota receive the `'rte_waiver'` discount type granting 100% waiver on tuition and designated fee heads.
 
 #### 7.4 Edge Cases & Failure Modes
 1. **Vouchers generated twice for the same class and month**: The bulk generation stored procedure checks for existing active vouchers matching `(school_id, enrollment_id, billing_month, billing_year)`. If the job is re-run for the same class cohort, the database rejects duplicate generation; exactly 0 new vouchers and 0 new ledger charges are inserted. The response reports: "0 vouchers generated; all students already have vouchers for this billing period."
-2. **Overpayment (extra becomes advance credit applied to the next voucher)**: When a payment exceeds the voucher's total outstanding balance (e.g., student owes $100.00 / 10,000 cents, payer tenders $140.00 / 14,000 cents), the voucher is marked `'paid'`, and the excess $40.00 (4,000 cents) is recorded as unallocated credit on the student's enrollment ledger (running balance = -4,000). When the subsequent month's voucher is generated (e.g., $100.00), the system automatically allocates the credit in `fee_payment_allocations`, reducing the net payable on the new voucher display to $60.00 (6,000 cents) without writing duplicate negative ledger rows.
+2. **Overpayment (extra becomes advance credit applied to the next voucher)**: When a payment exceeds the voucher's total outstanding balance (e.g., student owes ₹100.00 / 10,000 paise, payer tenders ₹140.00 / 14,000 paise), the voucher is marked `'paid'`, and the excess ₹40.00 (4,000 paise) is recorded as unallocated credit on the student's enrollment ledger (running balance = -4,000). When the subsequent month's voucher is generated (e.g., ₹100.00), the system automatically allocates the credit in `fee_payment_allocations`, reducing the net payable on the new voucher display to ₹60.00 (6,000 paise) without writing duplicate negative ledger rows.
 3. **Cancelling a voucher that already has a payment**: The cancellation procedure checks if any payment entries (`entry_type = 'payment'`) reference the `voucher_id`. If active payments exist, the cancellation request is strictly aborted with an exception: `"Cannot cancel voucher with recorded payments. Reverse or refund payments first."` Only after all payments on the voucher are reversed (`entry_type = 'reversal'`) or refunded (`entry_type = 'refund'`) can the voucher charges be cancelled.
-4. **Fee structure changed after vouchers already exist**: Class fee structures operate on an effective date and versioning model. Modifying a fee structure (e.g., increasing tuition from $100.00 to $120.00) leaves all existing generated vouchers and ledger charges completely unchanged at their snapshot values. Only vouchers generated after the fee structure modification use the updated rates.
-5. **Student joins mid-month**: When a student is admitted mid-month, the school's configured mid-month billing rule is evaluated: if admitted on or before the 15th calendar day of the month, 100% of the monthly tuition fee is billed; if admitted on or after the 16th calendar day, a 50% prorated tuition fee (rounded half-up to minor units) is billed, alongside full one-time admission and registration charges.
+4. **Fee structure changed after vouchers already exist**: Class fee structures operate on an effective date and versioning model. Modifying a fee structure (e.g., increasing tuition from ₹100.00 to ₹120.00) leaves all existing generated vouchers and ledger charges completely unchanged at their snapshot values. Only vouchers generated after the fee structure modification use the updated rates.
+5. **Student joins mid-month**: When a student is admitted mid-month, the school's configured mid-month billing rule (`school_settings.mid_month_admission_rule`) is evaluated:
+   - **Option 1 (`full_month` - Default)**: The student is billed 100% of the monthly tuition fee regardless of admission date. E.g., for a monthly tuition fee of ₹6,000 (600,000 paise) in September, joining on September 20 bills the full ₹6,000 (600,000 paise).
+   - **Option 2 (`half_after_cutoff_day`)**: If admitted on or before the configured cutoff day (`school_settings.mid_month_admission_cutoff_day`, default 15), 100% of monthly tuition is billed; if admitted after the cutoff day, a 50% prorated tuition fee (rounded half-up) is billed. E.g., with cutoff day 15 and tuition ₹6,000 (600,000 paise), joining on September 20 ($20 > 15$) bills $\text{round}(600000 \times 0.50) = \mathbf{300,000\text{ paise (₹3,000.00)}}$.
+   - **Option 3 (`daily_prorata`)**: Tuition is prorated strictly based on the remaining calendar days in the admission month (including the admission date): $\text{Prorated Fee} = \text{round}\left(\text{Monthly Tuition} \times \frac{\text{Days Remaining}}{\text{Total Days in Month}}\right)$. E.g., for a 30-day month (September), joining on September 20 leaves $30 - 20 + 1 = 11$ days $\to \text{round}\left(600000 \times \frac{11}{30}\right) = \mathbf{220,000\text{ paise (₹2,200.00)}}$.
+   In all options, one-time admission and registration charges are billed at 100% without proration.
 6. **Student struck off with unpaid fees**: When an enrollment status transitions to `'struck_off'` (or `'withdrawn'`), all existing unpaid ledger balances remain active and collectible as institutional debt. The bulk monthly voucher generator skips struck-off students, generating zero future charges. If the student subsequently requests academic clearance, transfer certificates, or re-admission, the accumulated debt must be settled in full.
 7. **Two cashiers collecting the same voucher at the same moment**: Collection transactions execute an explicit row-level lock on the voucher (`SELECT * FROM fee_vouchers WHERE id = $1 FOR UPDATE`). The first cashier's transaction locks the row, validates the outstanding balance, appends ledger entries, and updates the derived status only. The second cashier's concurrent transaction is forced to wait on the lock; once released, it reads the updated remaining balance. If the first payment fully settled the voucher, the second transaction is rejected with `"Voucher has already been paid"`, preventing concurrent double-collection or over-allocation.
 8. **Gateway webhook arrives twice**: The webhook handler queries the unique `idempotency_key` (payment gateway transaction ID) against `payment_webhook_events`. A repeated webhook with the same idempotency key is acknowledged with HTTP 200 OK and ignored without re-processing. If a genuinely distinct second payment arrives for an already settled voucher (e.g., parent initiated two separate bank transfers with different gateway transaction IDs), the second payment is recorded as an advance credit on the student's enrollment and an alert is flagged in the accountant dashboard for refund review.
 9. **Payment recorded against the wrong student**: Direct modification of payment records is forbidden. The accountant must execute a payment reversal specifying the incorrect entry ID and a mandatory reason (`"Payment posted to incorrect student enrollment"`). This writes an `entry_type = 'reversal'` entry referencing `reverses_entry_id`, restoring the original student's debit balance. The accountant then records a new payment against the correct student enrollment referencing the original receipt.
 10. **Refund**: Disbursing a refund writes an entry to `fee_ledger_entries` with `entry_type = 'refund'`, linked `reverses_entry_id` referencing the original payment entry, signed minor unit amount reducing net cash/bank balances, and a mandatory textual justification. The action is guarded by RLS and requires the user to possess the `fees:refund` permission.
 11. **Voucher printed twice**: Re-printing an existing voucher retrieves the stored voucher record and its line items without incrementing sequence counters or inserting ledger entries. The printed layout automatically adds a `"DUPLICATE COPY"` watermark, displaying the original issue date, original voucher number, and an incremented `reprint_count`.
-12. **School changes late-fine rule mid-year**: If a school updates its late fine policy (e.g., switching from a fixed $10.00 fee to a $1.50 per-day rate with a $15.00 cap), the new rule applies strictly to fee vouchers generated after the change date. Existing active vouchers continue to evaluate late fines according to the fine parameters stored with the voucher at the time of generation, preserving historical billing integrity.
+12. **School changes late-fine rule mid-year**: If a school updates its late fine policy (e.g., switching from a fixed ₹10.00 fee to a ₹1.50 per-day rate [150 paise] with a ₹15.00 cap [1,500 paise]), the new rule applies strictly to fee vouchers generated after the change date. Existing active vouchers continue to evaluate late fines according to the fine parameters stored with the voucher at the time of generation, preserving historical billing integrity.
 
 #### 7.5 Acceptance Criteria Checklist
 - [ ] A 500-student monthly voucher generation batch run finishes in under 60 seconds via `job_queue`.
@@ -683,11 +772,15 @@ Enterprise school billing engine. Features fee heads, class fee structures, bulk
 - [ ] A payment reversal restores the exact prior debit balance to the minor unit with zero arithmetic drift.
 - [ ] Two simultaneous collection requests executed concurrently against the same voucher never collect an amount exceeding the outstanding balance.
 - [ ] Sequential gapless numbering verification: A SQL query `SELECT voucher_number FROM fee_vouchers ORDER BY voucher_number` across 1,000 consecutively generated vouchers reveals zero missing integer sequence values.
-- [ ] Late fine calculation verified by automated unit tests: Late fine accrued equals $\min(\text{chargeable days} \times \text{per\_day amount}, \text{max\_cap})$ with zero compounding, charging all days since due date once grace is exceeded.
+- [ ] Late fine calculation verified by automated unit tests: Late fine accrued equals $\min(\text{chargeable days} \times \text{per\_day amount}, \text{max\_cap})$ with zero compounding, evaluating chargeable days per the voucher's snapshotted `grace_fine_mode` (`incremental` vs `retroactive`).
 - [ ] Payment allocation follows Section 3.4 FIFO waterfall priority exactly: arrears cleared first, late fine second, tuition third, auxiliary fourth, optional fifth.
 - [ ] Row Level Security test: In multi-tenant testing, a parent querying the vouchers API endpoint receives only vouchers associated with their linked children's `enrollment_id`s, returning 0 rows for other children in the same school.
-- [ ] Advance payment verification: When an overpayment of 14,000 cents is received against a 10,000 cents voucher, the ledger balance becomes -4,000 cents; generating next month's 10,000 cents voucher writes exactly one +10,000 charge entry, yielding a net ledger balance of +6,000 cents without double-counting advance credit (advance applied is recorded in payment allocations and displayed on the voucher without appending duplicate negative ledger amounts).
+- [ ] Advance payment verification: When an overpayment of 14,000 paise is received against a 10,000 paise voucher, the ledger balance becomes -4,000 paise; generating next month's 10,000 paise voucher writes exactly one +10,000 charge entry, yielding a net ledger balance of +6,000 paise without double-counting advance credit (advance applied is recorded in payment allocations and displayed on the voucher without appending duplicate negative ledger amounts).
 - [ ] Voucher dynamic balance reversal verification: In v_fee_voucher_balances, a payment of 3,000 minor units on a 5,500 voucher gives paid 3,000 and outstanding 2,500; after reversing that payment, paid is 0 and outstanding is 5,500.
+- [ ] Advance allocation dynamic balance verification: In `v_fee_voucher_balances`, when a payment of 14,000 minor units is recorded against Voucher A (10,000 net payable) and 4,000 advance credit is allocated to Voucher B (10,000 net payable) via `fee_payment_allocations`, Voucher A shows paid 10,000 and outstanding 0, Voucher B shows paid 4,000 and outstanding 6,000, and the student enrollment ledger balance (`SELECT SUM(amount) FROM fee_ledger_entries`) strictly equals +6,000.
+- [ ] Refund reversal verification: In `v_fee_voucher_balances`, a reversal of a refund reduces `total_refunds_minor_units` by the refund amount (using `l.amount`, not `-l.amount`), restoring `total_paid_minor_units` to its pre-refund value.
+- [ ] Cancelled voucher balance verification: In `v_fee_voucher_balances`, any voucher with status `'cancelled'` evaluates `outstanding_balance_minor_units` strictly as 0 minor units.
+- [ ] Voucher adjustment balance verification: In `v_fee_voucher_balances`, financial adjustment ledger entries (`entry_type = 'adjustment'`) linked to the voucher (and their reversals) are included in `outstanding_balance_minor_units`, dynamically raising or lowering the voucher balance.
 
 ---
 
@@ -769,10 +862,12 @@ Omnichannel school communication platform. Manages circulars and notices, school
 
 #### 10.3 Concrete Business Rules
 1. Notices support audience scoping: `all_school`, `specific_classes`, `teachers_only`, `parents_only`.
-2. SMS and WhatsApp messages are dispatched via pluggable adapters (`SmsAdapter`, `WhatsAppAdapter`). SMS credits/costs are tracked per tenant.
+2. **Multi-Channel Alert Hierarchy**: Mobile Push Notifications (FCM / APNs) serve as the primary alert channel for attendance, fees, and school circulars. Outbound SMS is strictly a secondary fallback channel.
 3. Message templates strictly validate merge variables against recipient data prior to dispatch.
 4. Student diary entries are scoped by date, class section, and subject.
 5. Direct parent-teacher messaging operates during configured working hours, with read receipts and audit logging.
+6. **TRAI DLT Compliance Mandate**: In India configuration, every outbound SMS must reference an approved DLT template (`dlt_entity_id`, `dlt_header`, `dlt_template_id`, `variable_count`). Raw free-text SMS is strictly blocked at the API gateway.
+7. **Development Console Adapter**: Local and staging environments utilize `ConsoleNotificationAdapter` which logs alert text and recipient numbers to stdout with zero external telecom dispatch.
 
 #### 10.4 Edge Cases & Failure Modes
 - External SMS gateway timeout or failure: System retries 3 times with exponential backoff; logs failure status in `notification_logs` without blocking application workflows.
@@ -964,7 +1059,7 @@ Institutional credential and document generation engine. Generates School Leavin
 5. Issued certificates store an immutable snapshot of generated text and a verification QR code URL (`/verify-cert/[uuid]`).
 
 #### 16.4 Edge Cases & Failure Modes
-- Attempting to issue a certificate with unpaid fees: Generation wizard blocks with error: "Outstanding balance of \$150.00 found. Settle dues before issuing Transfer Certificate."
+- Attempting to issue a certificate with unpaid fees: Generation wizard blocks with error: "Outstanding balance of ₹150.00 found. Settle dues before issuing Transfer Certificate."
 - Re-printing an existing certificate: Layout prints identical serial number with `"DUPLICATE COPY"` watermark and incremented print count.
 
 #### 16.5 Acceptance Criteria Checklist
@@ -1115,9 +1210,15 @@ Institutional configuration and data maintenance. School profile branding, acade
 #### 21.3 Concrete Business Rules
 1. School settings are stored in `schools` and `school_settings` with schema validation.
 2. All date and time stamps are stored in UTC; client views format dates in `schools.timezone`.
-3. Currency display is governed by `schools.default_currency`.
+3. **Currency & Locale Defaults**: `schools.default_currency` is pre-selected as `INR` with timezone `Asia/Kolkata`, date format `DD/MM/YYYY`, number formatting `en-IN` (Lakhs/Crores), and academic start month defaulting to April. Currency selection is permanently locked once the school's first fee voucher is generated.
 4. Payment gateway and SMS credentials are encrypted at rest using PostgreSQL `pgcrypto` or Supabase Vault.
 5. Bulk data export produces a password-protected ZIP archive containing CSV tables and uploaded student documents.
+6. **DPDP Act 2023 Privacy Settings**:
+   - Configurable per-school data retention (`data_retention_years`, defaulting to 7 years).
+   - Self-service Data Subject Requests for machine-readable export and student right-to-erasure upon institutional clearance.
+   - Parental consent logging (`data_consent_logs`) for processing minors' records.
+   - Mandatory Data Processing Agreement (`dpa_accepted_at`) executed by school administrators during onboarding.
+7. **Bilingual Typography Standards**: Supports English (`en-IN`) and Hindi (`hi-IN`) interfaces, utilizing `Inter` for Latin and `Noto Sans Devanagari` for Hindi script rendering across web, mobile, and PDF documents.
 
 #### 21.4 Edge Cases & Failure Modes
 - Admin enters invalid payment gateway API keys: System executes a lightweight test verification transaction; if validation fails, configuration is rejected with descriptive error.
@@ -1146,9 +1247,10 @@ Multi-tenant platform operations console for the SaaS provider (`super_admin`). 
 #### 22.3 Concrete Business Rules
 1. Platform Plans define strict quotas: `max_students`, `max_staff`, `storage_limit_mb`, and enabled feature flags.
 2. Tenant Creation Workflow:
-   - Inserts row into `schools`.
+   - Inserts row into `schools` with default currency `INR` (locked upon first voucher), timezone `Asia/Kolkata`, date format `DD/MM/YYYY`, number formatting `en-IN`, and start month `April`.
+   - Requires digital execution of the Data Processing Agreement (`schools.dpa_accepted_at`).
    - Provisions root `school_admin` user in Supabase Auth.
-   - Seeds default academic sessions, standard grading scale, default fee heads, and system roles.
+   - Pre-seeds selected board preset (`CBSE`, `ICSE`, `State`, `Custom`), populating classes (Nursery to 12 with streams), pass marks (33% for CBSE/State), default fee structures, and system roles.
 3. Audited Impersonation Protocol:
    - Super admin generates a short-lived (max 60 minutes) scoped JWT.
    - Impersonation session logs start time, super-admin UUID, target `school_id`, and reason.
@@ -1197,6 +1299,30 @@ Public-facing web landing page for each school tenant. Features customizable her
 
 ---
 
+### 4.24 Statutory Privacy & Data Protection Invariants (DPDP Act 2023)
+
+1. **Zero Tracking & No Advertising SDKs**:
+   - The web and mobile applications strictly prohibit embedding third-party advertising SDKs, behavioral tracking pixels, or third-party analytics SDKs that collect or transmit student personal identifiers (UDISE+ PEN, APAAR ID, student names, phone numbers, addresses, parent details).
+2. **Parental Consent for Minors**:
+   - Under DPDP Act Section 9, processing personal data of students under 18 years of age requires verifiable parental/guardian consent.
+   - All parental consents and statutory notice acknowledgments are captured immutably in `data_consent_logs` with SHA-256 notice digests, IP addresses, and timestamps.
+3. **Data Retention & Storage Limitation**:
+   - Schools configure data retention schedules via `schools.data_retention_years` (default 7 years following student graduation/clearance).
+   - Automated archival and purge jobs remove expired student logs and audit trails while preserving summarized financial records required by statutory tax laws.
+4. **Data Subject Rights (Export & Erasure)**:
+   - Self-service Data Subject Request (DSR) workflows allow parents/guardians to request machine-readable exports of their child's profile, attendance, and report cards in structured JSON/CSV format.
+   - Right to erasure is enforced via `data_subject_requests` once all fee dues and educational certifications are formally cleared by the school administration.
+5. **72-Hour Data Breach Incident Runbook**:
+   - Under Section 8(6) of the DPDP Act 2023, data fiduciaries must notify the Data Protection Board of India (DPBI) and affected data principals upon discovering a security compromise.
+   - Any suspected breach initiates a statutory record in `data_breach_logs` with a strict automated runbook:
+     - **Triage (0–12h)**: Threat containment, forensic log snapshotting, and impact severity classification.
+     - **Escalation (12–48h)**: Platform executive alert, legal counsel briefing, affected record identification.
+     - **Statutory Notification (Within 72h)**: Mandatory dispatch of breach disclosure report to DPBI and direct push/SMS breach advisory to affected school admins and parents.
+6. **Data Processing Agreement (DPA)**:
+   - Every school tenant onboarding flow mandates digital acceptance of the platform Data Processing Agreement (`schools.dpa_accepted_at`), legally codifying the platform as Data Processor and the School as Data Fiduciary.
+
+---
+
 ## 5. Verification and Acceptance Matrix
 
 The following matrix catalogs verification criteria counts and architectural guarantees across all 23 platform modules. Testable Criteria Counts reflect the exact number of formal checklist verification items defined in each module's specification.
@@ -1205,28 +1331,28 @@ The following matrix catalogs verification criteria counts and architectural gua
 | :---: | :--- | :---: | :---: | :---: | :---: |
 | 1 | Academic Setup | P0 | N/A (Structural Schema) | 5 | Yes |
 | 2 | Students | P0 | Section 3.7 (Promotion Decision Table) | 5 | Yes |
-| 3 | Staff and HR | P0/P1 | Section 9.3 (Leave & Salary Proration) | 5 | Yes |
-| 4 | Attendance | P0/P1 | Section 4.3 (Attendance % Formula) | 5 | Yes |
+| 3 | Staff and HR | P0/P1 | Module 3.3 & Module 9.3 (Leave & Salary Proration) | 5 | Yes |
+| 4 | Attendance | P0/P1 | Module 4.3 (Attendance % Formula) | 5 | Yes |
 | 5 | Timetable | P1 | N/A (Clash Detection Invariants) | 5 | Yes |
-| 6 | Exams and Results | P0/P1 | Section 3.5, 3.6 & 6.3 (GPA, Ranking, Exempt) | 5 | Yes |
-| 7 | Fees | P0 | Sections 3.1, 3.2, 3.3, 3.4 & 3.9 (Ledger & Advance) | 12 | Yes |
-| 8 | Accounts (V1) | P1 | Section 8.3 (Daily Closing Reconciliation) | 5 | Yes |
-| 9 | Payroll | P1 | Section 9.3 (Net Salary & Unpaid Leave EMI) | 5 | Yes |
+| 6 | Exams and Results | P0/P1 | Section 3.5, 3.6 & Module 6.3 (GPA, Ranking, Exempt) | 5 | Yes |
+| 7 | Fees | P0 | Sections 3.1, 3.2, 3.3, 3.4 & 3.9 (Ledger & Advance) | 16 | Yes |
+| 8 | Accounts (V1) | P1 | Module 8.3 (Daily Closing Reconciliation) | 5 | Yes |
+| 9 | Payroll | P1 | Module 9.3 (Net Salary & Unpaid Leave EMI) | 5 | Yes |
 | 10 | Communication | P0/P1 | N/A (Adapter Merge Variables) | 5 | Yes |
 | 11 | Learning / LMS | P1/P2 | N/A (Grading & Syllabus Tracking) | 5 | Yes |
-| 12 | Library | P2 | Section 12.3 (Overdue Fine Formulation) | 5 | Yes |
-| 13 | Inventory | P2 | Section 13.3 (Append-Only Stock Balance) | 5 | Yes |
-| 14 | Transport | P2 | Section 14.3 (Stop Fare & Fleet Capacity) | 5 | Yes |
-| 15 | Hostel | P2 | Section 15.3 (Room Billing & Segregation) | 5 | Yes |
-| 16 | Certificates and Cards | P1 | Section 16.3 (Sequence & Clearance Gate) | 5 | Yes |
-| 17 | Admissions and Enquiries | P1 | Section 17.3 (CRM Pipeline Conversion) | 5 | Yes |
-| 18 | Reports and Dashboards | P0/P1 | Section 18.3 (Materialized Aggregation) | 5 | Yes |
-| 19 | Roles and Permissions | P0 | Section 19.3 (Audit Triggers & RBAC) | 5 | Yes |
-| 20 | Portals | P0 | Section 20.3 (POS Terminal & Multi-Child) | 5 | Yes |
-| 21 | Settings and Data | P0/P1 | Section 3.8 (Half-Up Rounding & Tax) | 5 | Yes |
-| 22 | SaaS Layer | P1 | Section 22.3 (Quota Limiting & Impersonation) | 5 | Yes |
+| 12 | Library | P2 | Module 12.3 (Overdue Fine Formulation) | 5 | Yes |
+| 13 | Inventory | P2 | Module 13.3 (Append-Only Stock Balance) | 5 | Yes |
+| 14 | Transport | P2 | Module 14.3 (Stop Fare & Fleet Capacity) | 5 | Yes |
+| 15 | Hostel | P2 | Module 15.3 (Room Billing & Segregation) | 5 | Yes |
+| 16 | Certificates and Cards | P1 | Module 16.3 (Sequence & Clearance Gate) | 5 | Yes |
+| 17 | Admissions and Enquiries | P1 | Module 17.3 (CRM Pipeline Conversion) | 5 | Yes |
+| 18 | Reports and Dashboards | P0/P1 | Module 18.3 (Materialized Aggregation) | 5 | Yes |
+| 19 | Roles and Permissions | P0 | Module 19.3 (Audit Triggers & RBAC) | 5 | Yes |
+| 20 | Portals | P0 | Module 20.3 (POS Terminal & Multi-Child) | 5 | Yes |
+| 21 | Settings and Data | P0/P1 | Section 3.8 & Module 21.3 (Half-Up Rounding & Tax) | 5 | Yes |
+| 22 | SaaS Layer | P1 | Module 22.3 (Quota Limiting & Impersonation) | 5 | Yes |
 | 23 | Public School Page | P2 | N/A (Public Routing & Lead Generation) | 5 | Yes |
-| **Total** | **All 23 Modules** | - | - | **122** | **100%** |
+| **Total** | **All 23 Modules** | - | - | **126** | **100%** |
 
 ---
 

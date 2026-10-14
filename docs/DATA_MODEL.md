@@ -145,6 +145,7 @@ erDiagram
 CREATE TYPE school_status AS ENUM ('active', 'suspended', 'trial', 'archived');
 CREATE TYPE subscription_interval AS ENUM ('monthly', 'annual');
 CREATE TYPE subscription_invoice_status AS ENUM ('draft', 'open', 'paid', 'uncollectible', 'void');
+CREATE TYPE education_board AS ENUM ('cbse', 'icse', 'state_board', 'custom');
 ```
 
 #### Table: `subscription_plans`
@@ -178,15 +179,25 @@ CREATE TABLE schools (
     motto varchar(255),
     address text NOT NULL,
     city varchar(100) NOT NULL,
-    state varchar(100),
-    postal_code varchar(20),
-    country varchar(100) NOT NULL,
-    phone varchar(50) NOT NULL,
+    state varchar(100) NOT NULL,
+    pin_code varchar(10) NOT NULL,
+    country varchar(100) NOT NULL DEFAULT 'India',
+    phone varchar(50) NOT NULL, -- E.164 format (+91XXXXXXXXXX)
     email varchar(255) NOT NULL,
     website varchar(255),
-    default_currency varchar(3) NOT NULL,
-    timezone varchar(100) NOT NULL DEFAULT 'UTC',
-    date_format varchar(20) NOT NULL DEFAULT 'YYYY-MM-DD',
+    default_currency varchar(3) NOT NULL DEFAULT 'INR',
+    is_currency_locked boolean NOT NULL DEFAULT false, -- Locked once first fee voucher is generated
+    default_passing_percentage numeric(5,2) NOT NULL DEFAULT 33.00, -- CBSE / State default 33.00%
+    timezone varchar(100) NOT NULL DEFAULT 'Asia/Kolkata',
+    date_format varchar(20) NOT NULL DEFAULT 'DD/MM/YYYY',
+    number_format varchar(20) NOT NULL DEFAULT 'en-IN',
+    academic_year_start_month smallint NOT NULL DEFAULT 4 CONSTRAINT check_start_month CHECK (academic_year_start_month BETWEEN 1 AND 12),
+    board education_board NOT NULL DEFAULT 'cbse',
+    collect_aadhaar boolean NOT NULL DEFAULT false, -- Disabled by default; if true, encrypted at rest
+    data_retention_years integer NOT NULL DEFAULT 7, -- DPDP Act statutory student record retention
+    dpa_accepted_at timestamptz, -- Data Processing Agreement acceptance
+    dpa_accepted_by uuid REFERENCES auth.users(id),
+    dpa_version varchar(50),
     status school_status NOT NULL DEFAULT 'trial',
     trial_ends_at timestamptz,
     plan_id uuid REFERENCES subscription_plans(id) ON DELETE RESTRICT,
@@ -275,9 +286,9 @@ CREATE TABLE user_profiles (
     id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
     active_school_id uuid REFERENCES schools(id) ON DELETE SET NULL,
     email varchar(255) NOT NULL UNIQUE,
-    phone varchar(50),
-    first_name varchar(100) NOT NULL,
-    last_name varchar(100) NOT NULL,
+    phone varchar(15), -- E.164 +91 format (^\+91[6-9]\d{9}$)
+    full_name varchar(255) NOT NULL,
+    last_name varchar(100), -- Optional
     avatar_url text,
     is_super_admin boolean NOT NULL DEFAULT false,
     is_active boolean NOT NULL DEFAULT true,
@@ -431,6 +442,13 @@ CREATE TABLE academic_sessions (
 CREATE INDEX idx_academic_sessions_school ON academic_sessions(school_id, status);
 ```
 
+> [!NOTE]
+> **Board Presets Seeding (`CBSE`, `ICSE`, `State`, `Custom`)**:
+> - **CBSE Preset**: Seeds class list: Nursery (level -3), LKG (-2), UKG (-1), Class 1 through 10, Class 11 and 12 with streams (Science, Commerce, Arts/Humanities). Default pass mark initialized to `33.00%` (editable per school/class/subject). Grading bands marked: `to be copied from the pilot school's report card`.
+> - **State Board Preset**: Seeds class list: Nursery (-3) to Class 12 with streams. Default pass mark initialized to `33.00%` (editable). Grading bands marked: `to be copied from the pilot school's report card`.
+> - **ICSE Preset**: Seeds Nursery to Class 10 (ICSE) and Class 11–12 (ISC). Default pass mark initialized to `35.00%` (editable). Grading bands marked: `to be copied from the pilot school's report card`.
+> - **Custom Preset**: Provides blank defaults for customized academic structures.
+
 #### Table: `classes`
 ```sql
 CREATE TABLE classes (
@@ -438,8 +456,10 @@ CREATE TABLE classes (
     school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
     campus_id uuid NOT NULL REFERENCES campuses(id) ON DELETE RESTRICT,
     name varchar(100) NOT NULL,
-    numeric_level integer NOT NULL,
+    numeric_level integer NOT NULL, -- -3 (Nursery), -2 (LKG), -1 (UKG), 1 to 12
+    stream varchar(50) DEFAULT NULL, -- 'Science', 'Commerce', 'Arts' for Classes 11 and 12
     display_order integer NOT NULL DEFAULT 0,
+    default_passing_percentage numeric(5,2) DEFAULT NULL, -- Inherits from schools.default_passing_percentage if NULL
     description text,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -482,7 +502,7 @@ CREATE TABLE subjects (
     code varchar(50) NOT NULL,
     subject_type subject_type NOT NULL DEFAULT 'theory',
     credit_hours numeric(3,1) NOT NULL DEFAULT 1.0,
-    passing_percentage numeric(5,2) NOT NULL DEFAULT 40.00,
+    passing_percentage numeric(5,2) DEFAULT NULL, -- Nullable: when NULL, inherits from classes.default_passing_percentage, then schools.default_passing_percentage
     is_core boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -566,6 +586,7 @@ CREATE TYPE enrollment_status AS ENUM (
 );
 CREATE TYPE gender_type AS ENUM ('male', 'female', 'other');
 CREATE TYPE relationship_type AS ENUM ('father', 'mother', 'brother', 'sister', 'uncle', 'aunt', 'grandparent', 'legal_guardian');
+CREATE TYPE student_social_category AS ENUM ('general', 'obc', 'sc', 'st', 'ews');
 ```
 
 #### Table: `guardians`
@@ -574,17 +595,19 @@ CREATE TABLE guardians (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
     user_id uuid REFERENCES user_profiles(id) ON DELETE SET NULL,
-    first_name varchar(100) NOT NULL,
-    last_name varchar(100) NOT NULL,
+    full_name varchar(255) NOT NULL,
+    last_name varchar(100), -- Optional
     relationship relationship_type NOT NULL,
     national_id varchar(50),
-    phone varchar(50) NOT NULL,
-    alternate_phone varchar(50),
+    phone varchar(15) NOT NULL, -- E.164 +91 format (^\+91[6-9]\d{9}$)
+    alternate_phone varchar(15),
     email varchar(255),
     occupation varchar(100),
     annual_income_minor_units bigint DEFAULT 0,
     address text NOT NULL,
     city varchar(100),
+    state varchar(100),
+    pin_code varchar(10),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     created_by uuid REFERENCES auth.users(id),
@@ -603,22 +626,31 @@ CREATE TABLE students (
     user_id uuid REFERENCES user_profiles(id) ON DELETE SET NULL,
     admission_number varchar(100) NOT NULL,
     admission_date date NOT NULL,
-    first_name varchar(100) NOT NULL,
-    last_name varchar(100) NOT NULL,
+    full_name varchar(255) NOT NULL,
+    last_name varchar(100), -- Optional
     gender gender_type NOT NULL,
     date_of_birth date NOT NULL,
-    national_id_or_bform varchar(50),
+    social_category student_social_category NOT NULL DEFAULT 'general',
+    sr_number varchar(50), -- Scholar Register / General Register Number
+    pen varchar(50), -- Permanent Education Number (UDISE+)
+    apaar_id varchar(12), -- Automated Permanent Academic Account Registry (12 digits)
+    aadhaar_encrypted text, -- Stored encrypted at rest (only if school.collect_aadhaar = true)
+    aadhaar_masked varchar(12), -- Displayed masked e.g. XXXXXXXX1234
     blood_group varchar(10),
     religion varchar(50),
     caste varchar(50),
-    nationality varchar(50) DEFAULT 'Domestic',
+    nationality varchar(50) DEFAULT 'Indian',
     special_category varchar(50),
     medical_notes text,
     identification_mark text,
     photo_url text,
+    address text,
+    city varchar(100),
+    state varchar(100),
+    pin_code varchar(10),
     primary_guardian_id uuid REFERENCES guardians(id) ON DELETE SET NULL, -- Convenience column
     emergency_contact_name varchar(100) NOT NULL,
-    emergency_contact_phone varchar(50) NOT NULL,
+    emergency_contact_phone varchar(15) NOT NULL, -- E.164 +91 format
     status student_status NOT NULL DEFAULT 'active',
     custom_fields jsonb DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -760,15 +792,18 @@ CREATE TABLE employees (
     school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
     user_id uuid REFERENCES user_profiles(id) ON DELETE SET NULL,
     employee_code varchar(100) NOT NULL,
-    first_name varchar(100) NOT NULL,
-    last_name varchar(100) NOT NULL,
+    full_name varchar(255) NOT NULL,
+    last_name varchar(100), -- Optional
     gender gender_type NOT NULL,
     date_of_birth date NOT NULL,
-    national_id varchar(50) NOT NULL,
-    phone varchar(50) NOT NULL,
+    national_id varchar(50) NOT NULL, -- PAN or Voter ID or Passport
+    phone varchar(15) NOT NULL, -- E.164 +91 format (^\+91[6-9]\d{9}$)
     email varchar(255) NOT NULL,
     current_address text NOT NULL,
     permanent_address text,
+    city varchar(100),
+    state varchar(100),
+    pin_code varchar(10),
     department_id uuid NOT NULL REFERENCES departments(id) ON DELETE RESTRICT,
     designation_id uuid NOT NULL REFERENCES designations(id) ON DELETE RESTRICT,
     joining_date date NOT NULL,
@@ -778,7 +813,7 @@ CREATE TABLE employees (
     basic_salary_minor_units bigint NOT NULL DEFAULT 0,
     bank_name varchar(100),
     bank_account_number varchar(100),
-    bank_ifsc_or_iban varchar(50),
+    bank_ifsc varchar(20), -- Indian Financial System Code (e.g. HDFC0001234)
     status staff_status NOT NULL DEFAULT 'active',
     avatar_url text,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -1137,14 +1172,20 @@ CREATE TABLE exam_schedules (
     end_time time NOT NULL,
     room_id uuid REFERENCES rooms(id) ON DELETE SET NULL,
     max_marks numeric(6,2) NOT NULL DEFAULT 100.00,
-    passing_marks numeric(6,2) NOT NULL DEFAULT 40.00,
+    passing_marks numeric(6,2) DEFAULT NULL, -- Nullable: when NULL, inherits from subject, then class, then school
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     created_by uuid REFERENCES auth.users(id),
     updated_by uuid REFERENCES auth.users(id),
-    CONSTRAINT check_exam_marks CHECK (max_marks >= passing_marks),
+    CONSTRAINT check_exam_marks CHECK (passing_marks IS NULL OR max_marks >= passing_marks),
     UNIQUE (school_id, exam_term_id, class_id, subject_id)
 );
+
+-- Passing Marks Inheritance Hierarchy:
+-- 1. exam_schedules.passing_marks (if NOT NULL)
+-- 2. Else (exam_schedules.max_marks * subjects.passing_percentage / 100.0) (if subjects.passing_percentage IS NOT NULL)
+-- 3. Else (exam_schedules.max_marks * classes.default_passing_percentage / 100.0) (if classes.default_passing_percentage IS NOT NULL)
+-- 4. Else (exam_schedules.max_marks * schools.default_passing_percentage / 100.0) (school default, pre-seeded from board preset)
 
 CREATE INDEX idx_exam_schedules_term ON exam_schedules(school_id, exam_term_id, class_id);
 ```
@@ -1206,9 +1247,11 @@ CREATE INDEX idx_exam_agg_ranks ON exam_results_aggregate(school_id, exam_term_i
 
 #### Enums:
 ```sql
-CREATE TYPE fee_billing_frequency AS ENUM ('one_time', 'monthly', 'term', 'annual');
-CREATE TYPE fee_discount_type AS ENUM ('percentage', 'fixed_amount');
+CREATE TYPE fee_billing_frequency AS ENUM ('one_time', 'monthly', 'quarterly', 'half_yearly', 'term', 'annual');
+CREATE TYPE fee_discount_type AS ENUM ('percentage', 'fixed_amount', 'rte_waiver');
+CREATE TYPE payment_mode AS ENUM ('cash', 'cheque', 'bank_transfer', 'upi', 'net_banking', 'card', 'demand_draft');
 CREATE TYPE fee_fine_mode AS ENUM ('fixed_amount', 'per_day');
+CREATE TYPE grace_fine_mode AS ENUM ('incremental', 'retroactive');
 CREATE TYPE fee_voucher_status AS ENUM ('unpaid', 'partially_paid', 'paid', 'cancelled');
 CREATE TYPE fee_voucher_kind AS ENUM ('monthly', 'one_time');
 CREATE TYPE allocation_bucket AS ENUM ('arrears', 'fine', 'tuition', 'auxiliary', 'optional');
@@ -1287,7 +1330,8 @@ CREATE TABLE fee_discounts (
     updated_by uuid REFERENCES auth.users(id),
     CONSTRAINT check_discount_type_value CHECK (
         (discount_type = 'percentage' AND discount_percent IS NOT NULL AND discount_percent > 0 AND discount_percent <= 100 AND discount_amount_minor_units IS NULL) OR
-        (discount_type = 'fixed_amount' AND discount_amount_minor_units IS NOT NULL AND discount_amount_minor_units > 0 AND discount_percent IS NULL)
+        (discount_type = 'fixed_amount' AND discount_amount_minor_units IS NOT NULL AND discount_amount_minor_units > 0 AND discount_percent IS NULL) OR
+        (discount_type = 'rte_waiver' AND discount_percent = 100.00 AND discount_amount_minor_units IS NULL)
     ),
     UNIQUE (school_id, code)
 );
@@ -1321,6 +1365,7 @@ CREATE TABLE fee_late_fine_policies (
     school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
     name varchar(100) NOT NULL,
     fine_mode fee_fine_mode NOT NULL DEFAULT 'per_day',
+    grace_fine_mode grace_fine_mode NOT NULL DEFAULT 'incremental',
     daily_rate_minor_units bigint DEFAULT 0,
     fixed_amount_minor_units bigint DEFAULT 0,
     grace_period_days integer NOT NULL DEFAULT 5,
@@ -1356,7 +1401,14 @@ CREATE TABLE fee_vouchers (
     net_payable_at_issue_minor_units bigint NOT NULL DEFAULT 0,
     currency varchar(3) NOT NULL,
     status fee_voucher_status NOT NULL DEFAULT 'unpaid', -- Cached status updated only by functions
+    -- Issue-time late fine policy snapshots
     late_fine_policy_id uuid REFERENCES fee_late_fine_policies(id) ON DELETE RESTRICT,
+    fine_mode fee_fine_mode NOT NULL DEFAULT 'per_day',
+    grace_fine_mode grace_fine_mode NOT NULL DEFAULT 'incremental',
+    grace_period_days integer NOT NULL DEFAULT 5,
+    daily_fine_rate_minor_units bigint DEFAULT 0,
+    fixed_fine_amount_minor_units bigint DEFAULT 0,
+    max_fine_cap_minor_units bigint,
     barcode_hash varchar(255) NOT NULL,
     reprint_count integer NOT NULL DEFAULT 0,
     notes text,
@@ -1469,7 +1521,8 @@ CREATE TABLE fee_receipts (
     receipt_number varchar(100) NOT NULL,
     amount_paid_minor_units bigint NOT NULL,
     currency varchar(3) NOT NULL,
-    payment_method varchar(50) NOT NULL, -- 'cash', 'bank_transfer', 'online_gateway', 'cheque'
+    payment_mode payment_mode NOT NULL DEFAULT 'cash',
+    transaction_reference varchar(100), -- UPI UTR, Cheque No, DD No, Bank Reference No
     financial_account_id uuid NOT NULL, -- FK resolved via ALTER TABLE
     cashier_employee_id uuid REFERENCES employees(id) ON DELETE SET NULL,
     payment_date date NOT NULL DEFAULT CURRENT_DATE,
@@ -1484,10 +1537,72 @@ CREATE INDEX idx_fee_receipts_ledger ON fee_receipts(school_id, ledger_entry_id)
 CREATE INDEX idx_fee_receipts_date ON fee_receipts(school_id, payment_date);
 ```
 
+> [!NOTE]
+> **Voucher Dynamic UPI QR Code**:
+> Every generated fee voucher PDF automatically renders a dynamic UPI payment QR code adhering to NPCI specifications: `upi://pay?pa={school_upi_vpa}&pn={school_name}&am={outstanding_amount_in_rupees}&cu=INR&tn=Fee_Voucher_{voucher_number}`. Parents scanning via PhonePe, Google Pay, Paytm, or BHIM instantly pre-populate the exact payable amount and voucher reference.
+
 #### View: `v_fee_voucher_balances` (Dynamic Real-Time Balances)
 ```sql
 CREATE VIEW v_fee_voucher_balances
 WITH (security_invoker = true) AS
+WITH voucher_fines AS (
+    SELECT 
+        l.fee_voucher_id,
+        COALESCE(SUM(
+            CASE 
+                WHEN l.entry_type = 'fine' THEN l.amount
+                WHEN l.entry_type = 'reversal' AND rev.entry_type = 'fine' THEN l.amount
+                ELSE 0 
+            END
+        ), 0) AS total_fines_minor_units
+    FROM fee_ledger_entries l
+    LEFT JOIN fee_ledger_entries rev ON rev.id = l.reverses_entry_id
+    WHERE l.fee_voucher_id IS NOT NULL
+    GROUP BY l.fee_voucher_id
+),
+voucher_allocations AS (
+    SELECT 
+        a.fee_voucher_id,
+        COALESCE(SUM(a.amount_minor_units), 0) AS total_allocated_minor_units
+    FROM fee_payment_allocations a
+    WHERE NOT EXISTS (
+        SELECT 1 
+        FROM fee_ledger_entries rev 
+        WHERE rev.reverses_entry_id = a.ledger_entry_id 
+          AND rev.entry_type = 'reversal'
+    )
+    GROUP BY a.fee_voucher_id
+),
+voucher_refunds AS (
+    SELECT 
+        l.fee_voucher_id,
+        COALESCE(SUM(
+            CASE 
+                WHEN l.entry_type = 'refund' THEN l.amount
+                WHEN l.entry_type = 'reversal' AND rev.entry_type = 'refund' THEN l.amount
+                ELSE 0 
+            END
+        ), 0) AS total_refunds_minor_units
+    FROM fee_ledger_entries l
+    LEFT JOIN fee_ledger_entries rev ON rev.id = l.reverses_entry_id
+    WHERE l.fee_voucher_id IS NOT NULL
+    GROUP BY l.fee_voucher_id
+),
+voucher_adjustments AS (
+    SELECT 
+        l.fee_voucher_id,
+        COALESCE(SUM(
+            CASE 
+                WHEN l.entry_type = 'adjustment' THEN l.amount
+                WHEN l.entry_type = 'reversal' AND rev.entry_type = 'adjustment' THEN l.amount
+                ELSE 0 
+            END
+        ), 0) AS total_adjustments_minor_units
+    FROM fee_ledger_entries l
+    LEFT JOIN fee_ledger_entries rev ON rev.id = l.reverses_entry_id
+    WHERE l.fee_voucher_id IS NOT NULL
+    GROUP BY l.fee_voucher_id
+)
 SELECT 
     v.id AS fee_voucher_id,
     v.school_id,
@@ -1499,54 +1614,92 @@ SELECT
     v.total_charges_minor_units,
     v.total_discounts_minor_units,
     v.net_payable_at_issue_minor_units,
-    COALESCE(SUM(
-        CASE 
-            WHEN l.entry_type = 'fine' THEN l.amount
-            WHEN l.entry_type = 'reversal' AND rev.entry_type = 'fine' THEN l.amount
-            ELSE 0 
-        END
-    ), 0) AS total_fines_minor_units,
-    COALESCE(SUM(
-        CASE 
-            WHEN l.entry_type IN ('payment', 'advance_applied') THEN -l.amount
-            WHEN l.entry_type = 'reversal' AND rev.entry_type IN ('payment', 'advance_applied', 'refund') THEN -l.amount
-            WHEN l.entry_type = 'refund' THEN -l.amount
-            ELSE 0 
-        END
-    ), 0) AS total_paid_minor_units,
-    (
-        v.net_payable_at_issue_minor_units
-        + COALESCE(SUM(
-            CASE 
-                WHEN l.entry_type = 'fine' THEN l.amount
-                WHEN l.entry_type = 'reversal' AND rev.entry_type = 'fine' THEN l.amount
-                ELSE 0 
-            END
-        ), 0)
-        - COALESCE(SUM(
-            CASE 
-                WHEN l.entry_type IN ('payment', 'advance_applied') THEN -l.amount
-                WHEN l.entry_type = 'reversal' AND rev.entry_type IN ('payment', 'advance_applied', 'refund') THEN -l.amount
-                WHEN l.entry_type = 'refund' THEN -l.amount
-                ELSE 0 
-            END
-        ), 0)
-    ) AS outstanding_balance_minor_units
+    COALESCE(vf.total_fines_minor_units, 0) AS total_fines_minor_units,
+    COALESCE(vadj.total_adjustments_minor_units, 0) AS total_adjustments_minor_units,
+    GREATEST(0, COALESCE(va.total_allocated_minor_units, 0) - COALESCE(vr.total_refunds_minor_units, 0)) AS total_paid_minor_units,
+    CASE 
+        WHEN v.status = 'cancelled' THEN 0
+        ELSE (
+            v.net_payable_at_issue_minor_units
+            + COALESCE(vf.total_fines_minor_units, 0)
+            + COALESCE(vadj.total_adjustments_minor_units, 0)
+            - GREATEST(0, COALESCE(va.total_allocated_minor_units, 0) - COALESCE(vr.total_refunds_minor_units, 0))
+        )
+    END AS outstanding_balance_minor_units
 FROM fee_vouchers v
-LEFT JOIN fee_ledger_entries l ON l.fee_voucher_id = v.id
-LEFT JOIN fee_ledger_entries rev ON rev.id = l.reverses_entry_id
-WHERE v.deleted_at IS NULL
-GROUP BY 
-    v.id,
-    v.school_id,
-    v.enrollment_id,
-    v.voucher_number,
-    v.voucher_kind,
-    v.status,
-    v.due_date,
-    v.total_charges_minor_units,
-    v.total_discounts_minor_units,
-    v.net_payable_at_issue_minor_units;
+LEFT JOIN voucher_fines vf ON vf.fee_voucher_id = v.id
+LEFT JOIN voucher_allocations va ON va.fee_voucher_id = v.id
+LEFT JOIN voucher_refunds vr ON vr.fee_voucher_id = v.id
+LEFT JOIN voucher_adjustments vadj ON vadj.fee_voucher_id = v.id
+WHERE v.deleted_at IS NULL;
+```
+
+#### Function: `calculate_late_fine` (Deterministic Fine Calculation)
+Calculates accrued late fine minor units for a voucher based on its issue-time snapshotted policy parameters (`fine_mode`, `grace_fine_mode`, `grace_period_days`, `daily_fine_rate_minor_units`, `fixed_fine_amount_minor_units`, `max_fine_cap_minor_units`).
+- If `p_payment_date <= due_date` or `days_overdue <= grace_period_days`: Fine = 0.
+- If `days_overdue > grace_period_days`:
+  - `grace_fine_mode = 'incremental'`: Chargeable days = `days_overdue - grace_period_days`.
+  - `grace_fine_mode = 'retroactive'`: Chargeable days = `days_overdue` (all days since due date).
+- Applies `per_day` or `fixed_amount` rate, capped by `max_fine_cap_minor_units` (if set). Zero compounding.
+
+```sql
+CREATE OR REPLACE FUNCTION calculate_late_fine(
+    p_voucher_id uuid,
+    p_payment_date date DEFAULT CURRENT_DATE
+)
+RETURNS bigint AS $$
+DECLARE
+    v_voucher record;
+    v_days_overdue integer;
+    v_chargeable_days integer := 0;
+    v_raw_fine bigint := 0;
+BEGIN
+    SELECT 
+        due_date,
+        fine_mode,
+        grace_fine_mode,
+        grace_period_days,
+        daily_fine_rate_minor_units,
+        fixed_fine_amount_minor_units,
+        max_fine_cap_minor_units
+    INTO v_voucher
+    FROM fee_vouchers
+    WHERE id = p_voucher_id;
+
+    IF NOT FOUND OR p_payment_date <= v_voucher.due_date THEN
+        RETURN 0;
+    END IF;
+
+    v_days_overdue := p_payment_date - v_voucher.due_date;
+
+    IF v_days_overdue <= v_voucher.grace_period_days THEN
+        RETURN 0;
+    END IF;
+
+    -- Evaluate chargeable days according to snapshotted grace_fine_mode
+    IF v_voucher.grace_fine_mode = 'incremental' THEN
+        v_chargeable_days := v_days_overdue - v_voucher.grace_period_days;
+    ELSIF v_voucher.grace_fine_mode = 'retroactive' THEN
+        v_chargeable_days := v_days_overdue;
+    END IF;
+
+    -- Evaluate fine mode
+    IF v_voucher.fine_mode = 'fixed_amount' THEN
+        IF v_chargeable_days > 0 THEN
+            v_raw_fine := v_voucher.fixed_fine_amount_minor_units;
+        END IF;
+    ELSIF v_voucher.fine_mode = 'per_day' THEN
+        v_raw_fine := v_chargeable_days * v_voucher.daily_fine_rate_minor_units;
+    END IF;
+
+    -- Apply optional maximum cap
+    IF v_voucher.max_fine_cap_minor_units IS NOT NULL AND v_raw_fine > v_voucher.max_fine_cap_minor_units THEN
+        v_raw_fine := v_voucher.max_fine_cap_minor_units;
+    END IF;
+
+    RETURN v_raw_fine;
+END;
+$$ LANGUAGE plpgsql STABLE;
 ```
 
 ---
@@ -1832,6 +1985,11 @@ CREATE TABLE message_templates (
     channel comm_channel NOT NULL,
     template_text text NOT NULL,
     required_variables jsonb NOT NULL DEFAULT '[]'::jsonb,
+    dlt_entity_id varchar(50), -- TRAI Principal Entity ID (platform or school level)
+    dlt_header varchar(20), -- 6-character registered Sender ID / Header
+    dlt_template_id varchar(50), -- TRAI registered Content Template ID
+    variable_count integer NOT NULL DEFAULT 0, -- Count of dynamic {#var#} tokens
+    is_dlt_approved boolean NOT NULL DEFAULT false,
     is_active boolean NOT NULL DEFAULT true,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -1842,6 +2000,12 @@ CREATE TABLE message_templates (
 
 CREATE INDEX idx_msg_templates_school ON message_templates(school_id);
 ```
+
+> [!IMPORTANT]
+> **TRAI DLT Compliance & Alert Channel Hierarchy**:
+> - **Push First, SMS Fallback**: Mobile Push Notifications (FCM / APNs) serve as the primary alert channel for attendance, fees, and announcements. Outbound SMS is strictly a fallback channel for offline parents or critical alerts.
+> - **DLT Mandate**: In India configuration, every outbound SMS MUST bind to a pre-approved `dlt_template_id` with exact variable counts. Raw free-text SMS dispatch is strictly blocked at the service layer.
+> - **Development Adapter**: Development environments employ `ConsoleNotificationAdapter`, printing formatted alert payloads to the execution log with zero external network dispatch.
 
 #### Table: `notification_logs`
 ```sql
@@ -2532,7 +2696,7 @@ CREATE TABLE admission_enquiries (
     academic_session_id uuid NOT NULL REFERENCES academic_sessions(id) ON DELETE RESTRICT,
     target_class_id uuid NOT NULL REFERENCES classes(id) ON DELETE RESTRICT,
     student_first_name varchar(100) NOT NULL,
-    student_last_name varchar(100) NOT NULL,
+    student_last_name varchar(100), -- Optional
     gender gender_type NOT NULL,
     date_of_birth date NOT NULL,
     parent_name varchar(100) NOT NULL,
@@ -2708,20 +2872,65 @@ CREATE TABLE school_settings (
 CREATE INDEX idx_school_settings_key ON school_settings(school_id, setting_key);
 ```
 
+#### Settings Registry (`school_settings` Keys)
+
+The following registry catalogs all standardized configuration keys stored in `school_settings.setting_key`, their expected JSONB data schema, default values, hierarchy levels, and operational descriptions:
+
+| Setting Key | Data Type / Enum | Default Value | Config Level | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `academic_year_start_month` | `integer (1-12)` | `4` (April) | School | Month number when the standard institutional academic session begins (India default April). |
+| `default_passing_percentage` | `numeric(5,2)` | `33.00` | School / Class / Subject | Base passing mark percentage; inherited hierarchically down to class and subject when lower levels are NULL. |
+| `mid_month_admission_rule` | `enum ('full_month', 'half_after_cutoff_day', 'daily_prorata')` | `'full_month'` | School | Tuition fee proration rule for mid-cycle student admissions. |
+| `mid_month_admission_cutoff_day` | `integer (1-31)` | `15` | School | Calendar day cutoff used when `mid_month_admission_rule = 'half_after_cutoff_day'`. |
+| `due_day_of_month` | `integer (1-31)` | `10` | Fee Structure / School | Default calendar day of each month on which recurring fee vouchers become due. |
+| `absence_alert_offset_minutes` | `integer` | `10` | School | Dispatch delay buffer in minutes after attendance submission before parent alerts are sent. |
+| `absence_alert_cutoff_time` | `time ('HH:MM')` | `'09:30'` | School | Morning cutoff: if attendance unsubmitted, alerts teacher/admin; never alerts parents. |
+| `week_pattern` | `jsonb (array)` | `["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]` | School | Weekly working days; combined with institutional holiday calendar to evaluate real working days. |
+| `grading_preset` | `enum ('cbse_style', 'standard_4_0', 'percentage_only')` | `'cbse_style'` | School | Initial grading band and GPA conversion scale preset (all bands editable). |
+| `promotion_attendance_threshold` | `numeric(5,2)` | `75.00` | School | Minimum cumulative attendance percentage required for standard annual promotion without trial. |
+| `currency` | `varchar(3)` | `'INR'` | School | ISO-4217 currency code; pre-selected for Indian schools, permanently locked after first voucher/ledger entry. |
+| `timezone` | `varchar(100)` | `'Asia/Kolkata'` | School | IANA timezone string for institutional date and time rendering. |
+| `date_format` | `varchar(20)` | `'DD/MM/YYYY'` | School | Display date format pattern across web, mobile, and printed documents. |
+| `number_format` | `varchar(20)` | `'en-IN'` | School | Number grouping formatting (e.g. Lakhs/Crores in `en-IN` vs Western thousands). |
+| `education_board` | `enum ('cbse', 'icse', 'state', 'custom')` | `'cbse'` | School | Affiliation board preset pre-seeding class structures and pass thresholds. |
+| `collect_aadhaar` | `boolean` | `false` | School | Whether optional Aadhaar collection is enabled; if true, encrypted at rest and masked in UI. |
+| `data_retention_years` | `integer` | `7` | School | DPDP Act statutory student record retention period in years. |
+| `library_max_books_per_student` | `integer` | `3` | School / Class | Maximum concurrent book borrowings permitted per student. |
+| `library_loan_period_days` | `integer` | `14` | School | Maximum loan duration in calendar days before overdue penalties accrue. |
+| `library_daily_late_fine_minor_units` | `bigint` | `100` (₹1.00) | School | Daily late return fine in minor units (paise) per overdue library book. |
+| `hostel_curfew_time` | `time ('HH:MM')` | `'20:00'` | School / Hostel | Evening hostel gate pass curfew cutoff time. |
+| `rank_mode` | `enum ('shared', 'tie_break')` | `'shared'` | School | Class ranking mode: shared positions or deterministic multi-stage tie-breaking. |
+| `rank_sharing_format` | `enum ('competition', 'dense')` | `'competition'` | School | Format when `rank_mode = 'shared'`: Standard competition (`1, 2, 2, 4`) or Dense (`1, 2, 2, 3`). |
+| `grace_fine_mode` | `enum ('incremental', 'retroactive')` | `'incremental'` | Late Fine Policy / School | Late fine calculation behavior once grace period is exceeded. |
+| `notification_primary_channel` | `enum ('push', 'sms', 'email', 'whatsapp')` | `'push'` | School | Primary operational alert channel; mobile push notifications primary, SMS fallback. |
+| `sms_fallback_enabled` | `boolean` | `true` | School | Whether outbound SMS fallback is enabled for urgent attendance/fee alerts. |
+| `dlt_entity_id` | `varchar(50)` | `NULL` | School / Platform | Telemarketer / Principal Entity ID registered on TRAI DLT portal for Indian SMS dispatch. |
+
 ---
 
 ### 3.23 Payment Adapter Infrastructure
+
+#### Enums:
+```sql
+CREATE TYPE kyc_status AS ENUM ('not_submitted', 'pending', 'verified', 'rejected');
+```
 
 #### Table: `payment_gateway_configs`
 ```sql
 CREATE TABLE payment_gateway_configs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
-    provider varchar(50) NOT NULL, -- 'stripe', 'razorpay', 'easypaisa', 'jazzcash'
+    provider varchar(50) NOT NULL, -- 'razorpay', 'cashfree', 'stripe'
     is_active boolean NOT NULL DEFAULT true,
     environment varchar(20) NOT NULL DEFAULT 'sandbox',
     credentials_encrypted_jsonb jsonb NOT NULL,
     webhook_secret_encrypted text,
+    gateway_merchant_account_id varchar(255), -- Sub-merchant / Route account ID
+    kyc_status kyc_status NOT NULL DEFAULT 'not_submitted',
+    settlement_bank_account_masked varchar(50), -- e.g. XXXXXX4321
+    settlement_bank_ifsc varchar(20), -- Indian Financial System Code
+    upi_vpa varchar(255), -- Primary UPI Virtual Payment Address (e.g. school@icici)
+    split_settlement_enabled boolean NOT NULL DEFAULT true, -- Direct settlement to school account
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (school_id, provider)
@@ -2729,6 +2938,10 @@ CREATE TABLE payment_gateway_configs (
 
 CREATE INDEX idx_gateway_configs_school ON payment_gateway_configs(school_id);
 ```
+
+> [!IMPORTANT]
+> **Non-Custodial Direct Split Settlement**:
+> `PaymentGatewayAdapter` enforces a direct settlement model (e.g., Razorpay Route, Cashfree Split). The ERP platform **never takes custody of or pools school funds**. When a parent pays via UPI, Net Banking, or Card, the payment gateway splits and settles funds directly into the school's KYC-verified bank account, with the platform receiving only SaaS subscription / service fees under a separate billing invoice.
 
 #### Table: `payment_webhook_events`
 ```sql
@@ -2905,6 +3118,84 @@ ALTER TABLE fee_receipts
 ADD CONSTRAINT fk_fee_receipts_account 
 FOREIGN KEY (financial_account_id) REFERENCES financial_accounts(id) ON DELETE RESTRICT;
 ```
+
+---
+
+### 3.27 Digital Personal Data Protection (DPDP Act 2023) Compliance
+
+#### Table: `data_consent_logs` (Parental & Minor Consent Audit)
+```sql
+CREATE TABLE data_consent_logs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
+    user_id uuid REFERENCES user_profiles(id) ON DELETE SET NULL,
+    student_id uuid REFERENCES students(id) ON DELETE SET NULL,
+    guardian_id uuid REFERENCES guardians(id) ON DELETE SET NULL,
+    consent_type varchar(50) NOT NULL, -- 'admission_processing', 'minor_data_collection', 'emergency_contact', 'digilocker_fetch'
+    consent_version varchar(20) NOT NULL,
+    notice_text_digest varchar(64) NOT NULL, -- SHA-256 hash of statutory notice shown
+    is_granted boolean NOT NULL,
+    granted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    withdrawn_at timestamptz,
+    ip_address inet,
+    user_agent text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX idx_consent_logs_school ON data_consent_logs(school_id, student_id);
+```
+
+#### Table: `data_breach_logs` (72-Hour Statutory Incident Runbook)
+```sql
+CREATE TABLE data_breach_logs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
+    incident_reference varchar(100) NOT NULL UNIQUE,
+    severity varchar(20) NOT NULL, -- 'low', 'medium', 'high', 'critical'
+    affected_records_count integer NOT NULL DEFAULT 0,
+    data_categories_affected jsonb NOT NULL DEFAULT '[]'::jsonb,
+    incident_description text NOT NULL,
+    discovered_at timestamptz NOT NULL,
+    contained_at timestamptz,
+    reported_to_dpbi_at timestamptz, -- Mandatory within 72 hours of discovery per DPDP Act Section 8(6)
+    affected_users_notified_at timestamptz,
+    runbook_step varchar(100) NOT NULL DEFAULT 'triage', -- 'triage', 'containment', 'dpbi_notification', 'user_communication', 'remediation', 'closed'
+    remedial_measures text,
+    status varchar(50) NOT NULL DEFAULT 'open',
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX idx_breach_logs_school ON data_breach_logs(school_id, status);
+```
+
+#### Table: `data_subject_requests` (DPDP Right to Correction, Export & Erasure)
+```sql
+CREATE TABLE data_subject_requests (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id uuid NOT NULL REFERENCES schools(id) ON DELETE RESTRICT,
+    user_id uuid REFERENCES user_profiles(id) ON DELETE SET NULL,
+    student_id uuid REFERENCES students(id) ON DELETE SET NULL,
+    request_type varchar(50) NOT NULL, -- 'export', 'erasure', 'correction'
+    status varchar(50) NOT NULL DEFAULT 'pending', -- 'pending', 'verified', 'processing', 'completed', 'rejected'
+    rejection_reason text,
+    export_file_url text, -- Time-limited signed URL
+    requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    completed_at timestamptz,
+    processed_by uuid REFERENCES auth.users(id),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX idx_dsr_school ON data_subject_requests(school_id, status);
+```
+
+> [!IMPORTANT]
+> **DPDP Act 2023 Statutory Non-Functional Invariants**:
+> 1. **Zero Tracking / Zero Ads**: Web and mobile clients strictly prohibit third-party advertising SDKs and tracking pixels. No analytics SDK may transmit student identifiers (names, phone numbers, PEN, APAAR ID).
+> 2. **72-Hour DPBI Incident Notification Runbook**: Automated alerts trigger when `data_breach_logs` is created. If `reported_to_dpbi_at` is unpopulated within 60 hours of `discovered_at`, emergency high-priority escalation notifications are dispatched to `super_admin` and school legal officers.
+> 3. **Data Processing Agreement (DPA)**: Required digital signature flow at school onboarding (`schools.dpa_accepted_at`).
+> 4. **Parental Consent & Minors**: Verifiable consent is recorded in `data_consent_logs` for all student processing under 18 years of age.
 
 ---
 
