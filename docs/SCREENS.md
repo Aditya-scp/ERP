@@ -181,7 +181,7 @@ When a user authenticates, the application shell inspects `app_role` from the ve
       - **Staff (`school_admin`, `accountant`, `teacher`) and Parents**:
         - Requires confirmation by entering the user's current account password and an optional deletion reason (`data_subject_requests.reason`).
         - Lifecycle Progression: Created with `status = 'pending'`, then advances immediately to `status = 'scheduled'` once the password is authenticated and verified.
-        - The account is immediately deactivated, and `scheduled_anonymise_at` is set based on the school's configured retention policy (`school_settings.retention_years`, configured during onboarding; default awaiting legal confirmation).
+        - The account is immediately deactivated, and `scheduled_anonymise_at` is set based on the school's configured retention policy (`school_settings.retention_years`, explicitly selected during onboarding; no platform default; onboarding cannot be completed without it).
         - Dispatches an automated confirmation email or push notification to the user's verified contact coordinates.
         - Renders a prominent, persistent visible status banner on the account screen: `"Account scheduled for deletion on [scheduled_anonymise_at]. Personal data will be permanently anonymised upon retention expiry. Status: Scheduled."`
         - The user can cancel their request prior to execution via `[ Cancel Deletion Request ]`, transitioning the request to `status = 'cancelled'`.
@@ -1201,7 +1201,7 @@ When a user authenticates, the application shell inspects `app_role` from the ve
 - **Web Route**: `/admin/saas/schools/new`
 - **Allowed Roles**: `super_admin`
 - **Required Permission**: `saas:schools_write`
-- **Component Breakdown**: Tenant onboarding form: School Name, Subdomain slug (`delhi-public`), Primary Admin Email, Subscription Plan selection, Storage Quota (GB), and automatic seed trigger (creates 6 system custom roles and base schema settings).
+- **Component Breakdown**: Tenant onboarding form: School Name, Subdomain slug (`delhi-public`), Primary Admin Email, Subscription Plan selection, Storage Quota (GB), mandatory `retention_years` explicit selection (no platform default; onboarding cannot be completed without it; a lawyer or chartered accountant must confirm any suggested preset before one is added), and automatic seed trigger (creates 6 system custom roles and base schema settings).
 
 #### Screen 22.3: Super-Admin School Impersonation Launcher
 - **Web Route**: `/admin/saas/schools/[id]/impersonate`

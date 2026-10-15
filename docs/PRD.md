@@ -35,7 +35,7 @@ ERP is a multi-tenant school management software-as-a-service (SaaS) platform en
 15. **DPDP Act 2023 Statutory Privacy & Security**:
     - Web and mobile applications are strictly prohibited from embedding third-party advertising SDKs or tracking analytics transmitting student identifiers.
     - Verifiable parental consent logging (`data_consent_logs`) for processing student data under 18.
-    - Per-school data retention setting (default 7 years). Machine-readable data export and right-to-erasure workflows.
+    - Per-school data retention setting (`retention_years` has no platform default; onboarding requires explicit selection, and onboarding cannot be completed without it; a lawyer or chartered accountant must confirm any suggested preset before one is added). Machine-readable data export and right-to-erasure workflows.
     - Statutory `data_breach_logs` table enforcing a 72-hour Data Protection Board of India (DPBI) incident notification runbook.
     - Digitally signed Data Processing Agreement (DPA) required during school onboarding.
 16. **Bilingual Languages & Typography**:
@@ -1214,7 +1214,7 @@ Institutional configuration and data maintenance. School profile branding, acade
 4. Payment gateway and SMS credentials are encrypted at rest using PostgreSQL `pgcrypto` or Supabase Vault.
 5. Bulk data export produces a password-protected ZIP archive containing CSV tables and uploaded student documents.
 6. **DPDP Act 2023 Privacy Settings**:
-   - Configurable per-school data retention (`data_retention_years`, defaulting to 7 years).
+   - Configurable per-school data retention (`retention_years` has no platform default; onboarding requires explicit selection, and onboarding cannot be completed without it; a lawyer or chartered accountant must confirm any suggested preset before one is added).
    - Self-service Data Subject Requests for machine-readable export and student right-to-erasure upon institutional clearance.
    - Parental consent logging (`data_consent_logs`) for processing minors' records.
    - Mandatory Data Processing Agreement (`dpa_accepted_at`) executed by school administrators during onboarding.
@@ -1307,8 +1307,8 @@ Public-facing web landing page for each school tenant. Features customizable her
    - Under DPDP Act Section 9, processing personal data of students under 18 years of age requires verifiable parental/guardian consent.
    - All parental consents and statutory notice acknowledgments are captured immutably in `data_consent_logs` with SHA-256 notice digests, IP addresses, and timestamps.
 3. **Data Retention & Storage Limitation**:
-   - Schools configure data retention schedules via `schools.data_retention_years` (default 7 years following student graduation/clearance).
-   - Automated archival and purge jobs remove expired student logs and audit trails while preserving summarized financial records required by statutory tax laws.
+   - Schools configure record retention schedules via `schools.retention_years` (mandatory explicit selection during onboarding; no platform default; onboarding cannot be completed without it; a lawyer or chartered accountant must confirm any suggested preset before one is added).
+   - When the configured retention period expires, an automated processing job permanently anonymises personal identifiers only, while statutory financial receipts, ledger entries, attendance records, and exam marks are never deleted.
 4. **Data Subject Rights (Export & Erasure)**:
    - Self-service Data Subject Request (DSR) workflows allow parents/guardians to request machine-readable exports of their child's profile, attendance, and report cards in structured JSON/CSV format.
    - Right to erasure is enforced via `data_subject_requests` once all fee dues and educational certifications are formally cleared by the school administration.

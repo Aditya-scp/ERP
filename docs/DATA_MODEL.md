@@ -194,7 +194,7 @@ CREATE TABLE schools (
     academic_year_start_month smallint NOT NULL DEFAULT 4 CONSTRAINT check_start_month CHECK (academic_year_start_month BETWEEN 1 AND 12),
     board education_board NOT NULL DEFAULT 'cbse',
     collect_aadhaar boolean NOT NULL DEFAULT false, -- Disabled by default; if true, encrypted at rest
-    data_retention_years integer NOT NULL DEFAULT 7, -- DPDP Act statutory student record retention
+    retention_years integer NOT NULL, -- Mandatory explicit selection during onboarding; no platform default
     dpa_accepted_at timestamptz, -- Data Processing Agreement acceptance
     dpa_accepted_by uuid REFERENCES auth.users(id),
     dpa_version varchar(50),
@@ -2981,7 +2981,7 @@ The following registry catalogs all standardized configuration keys stored in `s
 | `number_format` | `varchar(20)` | `'en-IN'` | School | Number grouping formatting (e.g. Lakhs/Crores in `en-IN` vs Western thousands). |
 | `education_board` | `enum ('cbse', 'icse', 'state', 'custom')` | `'cbse'` | School | Affiliation board preset pre-seeding class structures and pass thresholds. |
 | `collect_aadhaar` | `boolean` | `false` | School | Whether optional Aadhaar collection is enabled; if true, encrypted at rest and masked in UI. |
-| `retention_years` | `integer` | Pending legal confirmation (see OPEN_QUESTIONS.md) | School | Institutional record retention period in years; set during onboarding. When expired, personal identifiers are anonymised while historical financial and academic records remain intact. |
+| `retention_years` | `integer` | None (Mandatory selection) | School | Record retention period in years. No platform default; onboarding wizard requires each school to select it explicitly, and onboarding cannot be completed without it (a lawyer or chartered accountant must confirm any suggested preset before one is added). When expired, personal identifiers are permanently anonymised while financial and academic records remain intact. |
 | `library_max_books_per_student` | `integer` | `3` | School / Class | Maximum concurrent book borrowings permitted per student. |
 | `library_loan_period_days` | `integer` | `14` | School | Maximum loan duration in calendar days before overdue penalties accrue. |
 | `library_daily_late_fine_minor_units` | `bigint` | `100` (₹1.00) | School | Daily late return fine in minor units (paise) per overdue library book. |
