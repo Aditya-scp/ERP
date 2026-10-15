@@ -636,8 +636,8 @@ When a user authenticates, the application shell inspects `app_role` from the ve
   - Top Search Bar (`F2`): Instant lookup by Roll No, Admission No, or Name.
   - Left Pane: Student Demographic Card, Linked Siblings Switcher, Total Outstanding Balance (Large Indigo Display: e.g. `₹5,500.00`).
   - Center Pane: Unpaid Vouchers Table with checkboxes, fine amounts, and partial payment input field.
-  - Right Pane: Payment Tender Box: Mode dropdown (`Cash`, `Cheque`, `UPI QR`, `Bank Transfer`, `Card`, `Demand Draft`), Amount Tendered, Change Due, Reference Number.
-  - Bottom Action Bar: `[ F4: Collect Cash & Print Slip ]`, `[ F8: Generate Sibling Invoice ]`, `[ Esc: Clear ]`. Browser standard A4/A5 print.
+  - Right Pane: Payment Tender Box: Mode dropdown (`Cash`, `Cheque`, `UPI QR`, `Bank Transfer`, `Card`, `Demand Draft`), Amount Tendered, Change Due, Reference Number (`F9: Cycle Payment Tender`).
+  - Bottom Action Bar: `[ F2: Search ]`, `[ F4: Collect and print slip ]`, `[ F8: Generate Sibling Invoice ]`, `[ F9: Cycle Payment Tender (Cash, UPI QR, Net Banking, Demand Draft) ]`, `[ Esc: Clear ]`. Browser standard A4/A5 print.
 
 #### Screen 7.7: Mobile Accountant Rapid Collection & Receipt Share
 - **Mobile Route**: `/(accountant)/fees/collect`
