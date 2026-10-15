@@ -6,7 +6,9 @@ This document tracks unresolved product decisions, tenant configuration variatio
 
 ## 1. Pending Decisions (Awaiting User Resolution)
 
-*None. All pending baseline architectural, domain, and localization decisions have been formally resolved, confirmed, and codified across `docs/PRD.md` and `docs/DATA_MODEL.md`.*
+| # | Topic | Question / Options | Context & Impact | Target Resolution Date |
+| :-: | :--- | :--- | :--- | :--- |
+| 1 | **Statutory Default for `school_settings.retention_years`** | What statutory default value should be recommended or pre-selected during school onboarding for `school_settings.retention_years`?<br><br>**Options**:<br>1. **7 years** (Standard benchmark under Indian Income Tax / limitation statutes)<br>2. **5 years** (General administrative record retention cycle)<br>3. **Blank / Explicit Selection Mandatory** (No platform default; onboarding wizard requires explicit configuration per school board and trust guidelines) | Retention period is a per-school setting configured during onboarding. Under institutional invariants, core financial and academic records (`fee_receipts`, `fee_ledger_entries`, `exam_marks`, `student_attendances`) are perpetual and never deleted; only personal identifiers (PII) are permanently anonymised when retention expires (`scheduled_anonymise_at`). Formal confirmation by legal counsel is required before locking a default preset. | Awaiting Legal Counsel Confirmation |
 
 ---
 

@@ -2981,7 +2981,7 @@ The following registry catalogs all standardized configuration keys stored in `s
 | `number_format` | `varchar(20)` | `'en-IN'` | School | Number grouping formatting (e.g. Lakhs/Crores in `en-IN` vs Western thousands). |
 | `education_board` | `enum ('cbse', 'icse', 'state', 'custom')` | `'cbse'` | School | Affiliation board preset pre-seeding class structures and pass thresholds. |
 | `collect_aadhaar` | `boolean` | `false` | School | Whether optional Aadhaar collection is enabled; if true, encrypted at rest and masked in UI. |
-| `data_retention_years` | `integer` | `7` | School | DPDP Act statutory student record retention period in years. |
+| `retention_years` | `integer` | Pending legal confirmation (see OPEN_QUESTIONS.md) | School | Institutional record retention period in years; set during onboarding. When expired, personal identifiers are anonymised while historical financial and academic records remain intact. |
 | `library_max_books_per_student` | `integer` | `3` | School / Class | Maximum concurrent book borrowings permitted per student. |
 | `library_loan_period_days` | `integer` | `14` | School | Maximum loan duration in calendar days before overdue penalties accrue. |
 | `library_daily_late_fine_minor_units` | `bigint` | `100` (₹1.00) | School | Daily late return fine in minor units (paise) per overdue library book. |
@@ -3264,25 +3264,40 @@ CREATE TABLE data_subject_requests (
     user_id uuid REFERENCES user_profiles(id) ON DELETE SET NULL,
     student_id uuid REFERENCES students(id) ON DELETE SET NULL,
     request_type varchar(50) NOT NULL, -- 'export', 'erasure', 'correction'
-    status varchar(50) NOT NULL DEFAULT 'pending', -- 'pending', 'verified', 'processing', 'completed', 'rejected'
-    rejection_reason text,
-    export_file_url text, -- Time-limited signed URL
+    status varchar(50) NOT NULL DEFAULT 'pending', -- 'pending', 'verified', 'scheduled', 'processing', 'completed', 'rejected', 'cancelled'
+    reason text, -- Requester's stated reason for erasure/export
+    rejection_reason text, -- Administrative reason if request is rejected
+    decided_by uuid REFERENCES auth.users(id), -- Administrator who reviewed and decided (e.g. for student erasure)
+    decided_at timestamptz, -- Timestamp when the request was reviewed and decided
+    scheduled_anonymise_at timestamptz, -- Date/time when personal identifiers will be irreversibly anonymised
+    export_file_url text, -- Time-limited signed URL for export archives
     requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     completed_at timestamptz,
-    processed_by uuid REFERENCES auth.users(id),
+    processed_by uuid REFERENCES auth.users(id), -- System or admin executor who finalised the operation
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT chk_dsr_scheduled_has_time CHECK (
+        (status = 'scheduled' AND scheduled_anonymise_at IS NOT NULL) OR (status <> 'scheduled')
+    )
 );
 
 CREATE INDEX idx_dsr_school ON data_subject_requests(school_id, status);
+CREATE INDEX idx_dsr_scheduled_anonymise ON data_subject_requests(scheduled_anonymise_at) WHERE status = 'scheduled';
 ```
 
 > [!IMPORTANT]
-> **DPDP Act 2023 Statutory Non-Functional Invariants**:
-> 1. **Zero Tracking / Zero Ads**: Web and mobile clients strictly prohibit third-party advertising SDKs and tracking pixels. No analytics SDK may transmit student identifiers (names, phone numbers, PEN, APAAR ID).
-> 2. **72-Hour DPBI Incident Notification Runbook**: Automated alerts trigger when `data_breach_logs` is created. If `reported_to_dpbi_at` is unpopulated within 60 hours of `discovered_at`, emergency high-priority escalation notifications are dispatched to `super_admin` and school legal officers.
-> 3. **Data Processing Agreement (DPA)**: Required digital signature flow at school onboarding (`schools.dpa_accepted_at`).
-> 4. **Parental Consent & Minors**: Verifiable consent is recorded in `data_consent_logs` for all student processing under 18 years of age.
+> **Data Subject Requests & Institutional Anonymisation Invariants**:
+> 1. **Unified Request Lifecycle**: All erasure and export requests use a unified status progression: `'pending', 'verified', 'scheduled', 'processing', 'completed', 'rejected', 'cancelled'`.
+>    - **Staff and Parents**: Start at `pending`, automatically advance to `scheduled` upon password verification with `scheduled_anonymise_at` computed from `school_settings.retention_years`.
+>    - **Students**: Enter `pending` until reviewed by `school_admin`, advancing to `scheduled` if approved or `rejected` with `rejection_reason`.
+>    - Either requester can cancel a `pending` or `scheduled` request prior to execution, transitioning it to `cancelled`.
+> 2. **Immutable Academic & Financial Records (Never Deleted)**: Under statutory accounting, taxation, and educational compliance mandates, financial records (`fee_receipts`, `fee_vouchers`, `fee_ledger_entries`), attendance registers (`student_attendances`, `employee_attendances`), and academic evaluations (`exam_marks`, `exam_results_aggregate`) are **never deleted or truncated**. When retention expires (`scheduled_anonymise_at`), an automated processing job **anonymises personal identifiers only** (scrambling `full_name`, `phone`, `email`, `address`, `aadhaar_encrypted`, `national_id`, `emergency_contact_phone`), while retaining audit and ledger balances intact.
+> 3. **Sole School Administrator Deletion Guard**: A user who is an active `school_admin` and the sole active `school_admin` for that school cannot request account deletion until institutional administrative ownership is first transferred to another active user.
+> 4. **DPDP Act 2023 Statutory Non-Functional Invariants**:
+>    - **Zero Tracking / Zero Ads**: Web and mobile clients strictly prohibit third-party advertising SDKs and tracking pixels. No analytics SDK may transmit student identifiers (names, phone numbers, PEN, APAAR ID).
+>    - **72-Hour DPBI Incident Notification Runbook**: Automated alerts trigger when `data_breach_logs` is created. If `reported_to_dpbi_at` is unpopulated within 60 hours of `discovered_at`, emergency high-priority escalation notifications are dispatched to `super_admin` and school legal officers.
+>    - **Data Processing Agreement (DPA)**: Required digital signature flow at school onboarding (`schools.dpa_accepted_at`).
+>    - **Parental Consent & Minors**: Verifiable consent is recorded in `data_consent_logs` for all student processing under 18 years of age.
 
 ---
 
