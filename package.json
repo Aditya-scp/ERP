@@ -1,0 +1,36 @@
+{
+  "name": "@erp/root",
+  "private": true,
+  "packageManager": "pnpm@12.11.2",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "dev:web": "turbo run dev --filter=@erp/web",
+    "dev:mobile": "turbo run dev --filter=@erp/mobile",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "test:rls": "pnpm exec supabase test db",
+    "test:e2e": "turbo run test:e2e --filter=@erp/web",
+    "db:start": "pnpm exec supabase start",
+    "db:reset": "pnpm exec supabase db reset",
+    "db:migrate": "pnpm exec supabase migration up --local",
+    "gen:types": "pnpm exec supabase gen types typescript --local > packages/types/src/database.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.22.0",
+    "eslint": "^9.22.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.4.3",
+    "prettier": "^3.5.3",
+    "supabase": "^2.121.0",
+    "turbo": "^2.11.9",
+    "typescript": "^5.8.2",
+    "typescript-eslint": "^8.26.0"
+  }
+}

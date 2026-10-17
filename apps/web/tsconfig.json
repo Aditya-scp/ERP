@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "plugins": [{ "name": "next" }],
+    "paths": {
+      "@/*": ["./app/*", "./src/*"],
+      "@erp/config": ["../../packages/config/src"],
+      "@erp/config/brand": ["../../packages/config/src/brand"],
+      "@erp/config/env/public": ["../../packages/config/src/env.public"],
+      "@erp/config/env/server": ["../../packages/config/src/env.server"],
+      "@erp/config/routes": ["../../packages/config/src/routes"],
+      "@erp/core": ["../../packages/core/src"],
+      "@erp/types": ["../../packages/types/src"],
+      "@erp/ui": ["../../packages/ui/src"]
+    },
+    "jsx": "preserve",
+    "lib": ["dom", "dom.iterable", "ES2022"]
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}

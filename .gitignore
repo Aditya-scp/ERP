@@ -1,7 +1,37 @@
+# Environment files
 .env
 .env.*
 !.env.example
-# reference screenshots (bulky, third-party images)
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+.next/
+.expo/
+expo-env.d.ts
+*.tsbuildinfo
+
+# Supabase
+supabase/.temp/
+supabase/.branches/
+
+# Turborepo
+.turbo/
+
+# Testing & Coverage
+coverage/
+test-results/
+playwright-report/
+
+# System / Editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Reference screenshots (bulky, third-party images)
 reference/**/*.png
 reference/**/*.jpg
 reference/**/*.jpeg

@@ -1,0 +1,12 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+minimumReleaseAge: 0
+allowBuilds:
+  esbuild: true
+  sharp: true
+  supabase: true
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - supabase
