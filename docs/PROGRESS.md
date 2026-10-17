@@ -13,7 +13,7 @@ Per [AGENTS.md](file:///c:/Users/DELL/ERP/AGENTS.md), this document must be revi
 | Layer / Component Area | Target Scope | Current Status | Completion % | Primary Deliverable Artifacts |
 | :--- | :--- | :---: | :---: | :--- |
 | **Milestone 0: Specification Suite** | 7 Architecture Documents | **Completed** | **100%** | `PRD.md`, `DATA_MODEL.md`, `PERMISSIONS.md`, `SCREENS.md`, `DESIGN_SYSTEM.md`, `OPEN_QUESTIONS.md`, `PROGRESS.md` |
-| **Milestone 1: Monorepo & Tooling** | Turborepo, pnpm Workspaces | Pending Start | 0% | Root configs, `package.json`, `pnpm-workspace.yaml`, `turbo.json`, tsconfig, eslint |
+| **Milestone 1: Monorepo & Tooling** | Turborepo, pnpm Workspaces, Next 16, Expo SDK 57 | **Completed** | **100%** | Root configs, `package.json`, `pnpm-workspace.yaml`, `turbo.json`, `apps/web`, `apps/mobile`, `@erp/config`, `@erp/types`, `@erp/core`, `@erp/ui`, `supabase/` |
 | **Milestone 2: Database & Security** | 113 Tables, Auth Hook, RLS, pgTAP | Pending Start | 0% | `supabase/migrations/`, `supabase/tests/`, SQL triggers, Auth Hook in `public` |
 | **Milestone 3: Shared Core Packages**| `packages/core`, `types`, `ui`, `config` | Pending Start | 0% | Business logic, Zod validation, shadcn/ui components, brand config |
 | **Milestone 4: Web Client (`apps/web`)**| Next.js App Router, SSR Auth, 24 Modules | Pending Start | 0% | Route hierarchy, TanStack tables, layouts, dialogs, print CSS |
@@ -226,3 +226,4 @@ The following 23 confirmed architectural choices govern all downstream developme
 | **India Localization**| Updated PRD, Data Model, and Open Questions with CBSE/State presets, INR locking, TRAI DLT templates, DPDP Act 2023 compliance, bilingual typography. | `docs/PRD.md`, `docs/DATA_MODEL.md`, `docs/OPEN_QUESTIONS.md` |
 | **Retention Policy** | Codified Decision 23: Mandatory explicit selection for `retention_years` during onboarding; no platform default; eliminated 7-year statutory benchmark claim across all docs. | `docs/OPEN_QUESTIONS.md`, `docs/DATA_MODEL.md`, `docs/PRD.md`, `docs/SCREENS.md` |
 | **Progress Dashboard**| Authored comprehensive project roadmap, module tracking matrix, and DoD verification checklist. | `docs/PROGRESS.md` |
+| **Monorepo Scaffolding** | Full monorepo scaffolding: Next.js 16, Expo SDK 57 (unified React 19), Turborepo, pnpm 12, Supabase CLI, 125-screen route manifest, full verification suite. | Monorepo root, `apps/*`, `packages/*`, `supabase/*`, `docs/ARCHITECTURE.md` |
