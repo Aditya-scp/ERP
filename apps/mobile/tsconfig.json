@@ -1,0 +1,33 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-native",
+    "paths": {
+      "@erp/config": [
+        "../../packages/config/src"
+      ],
+      "@erp/config/brand": [
+        "../../packages/config/src/brand"
+      ],
+      "@erp/config/env/public": [
+        "../../packages/config/src/env.public"
+      ],
+      "@erp/config/routes": [
+        "../../packages/config/src/routes"
+      ],
+      "@erp/core": [
+        "../../packages/core/src"
+      ],
+      "@erp/types": [
+        "../../packages/types/src"
+      ]
+    }
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    ".expo/types/**/*.ts",
+    "expo-env.d.ts",
+    "nativewind-env.d.ts"
+  ]
+}

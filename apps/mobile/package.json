@@ -1,0 +1,31 @@
+{
+  "name": "@erp/mobile",
+  "version": "0.0.0",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "dev": "expo start",
+    "lint": "eslint app/",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@erp/config": "workspace:*",
+    "@erp/core": "workspace:*",
+    "@erp/types": "workspace:*",
+    "expo": "~57.0.30",
+    "expo-constants": "~57.0.22",
+    "expo-linking": "~57.0.13",
+    "expo-router": "~57.0.28",
+    "expo-status-bar": "~57.0.1",
+    "nativewind": "^4.2.7",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.18",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~6.0.3"
+  }
+}

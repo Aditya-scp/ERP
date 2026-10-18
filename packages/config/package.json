@@ -1,0 +1,23 @@
+{
+  "name": "@erp/config",
+  "version": "0.0.0",
+  "private": true,
+  "exports": {
+    "./brand": "./src/brand.ts",
+    "./env/public": "./src/env.public.ts",
+    "./env/server": "./src/env.server.ts",
+    "./routes": "./src/routes.ts"
+  },
+  "scripts": {
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "server-only": "^0.0.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.7"
+  }
+}
